@@ -391,6 +391,17 @@ class JanitorConfig(BaseModel):
     threshold: float = DEFAULTS["janitor"]["threshold"]
     target: float = DEFAULTS["janitor"]["target"]
     priority_delete: List[str] = DEFAULTS["janitor"]["priority_delete"]
+
+    @field_validator('monitor_path')
+    def validate_monitor_path(cls, v):
+        if not v:
+            raise ValueError("Janitor monitor_path cannot be empty.")
+        if not os.path.exists(v):
+            raise ValueError(f"Janitor monitor_path '{v}' does not exist.")
+        if not os.path.isdir(v):
+            raise ValueError(f"Janitor monitor_path '{v}' is not a directory.")
+        return v
+
     @model_validator(mode='after')
     def validate_disk_logic(self):
         # Ensures that the cleanup trigger threshold is higher than the target cleanup level.
@@ -1728,15 +1739,7 @@ class Pipeline:
         self.camera_k_file = os.path.join(self.general_log_dir, "camera_k.csv")
         self.masterpiece_archive_dir = os.path.join(self.daylight_out_dir, "archive")
  
-        os.makedirs(self.events_out_dir, exist_ok=True)
-        os.makedirs(self.timelapse_out_dir, exist_ok=True)
-        os.makedirs(self.general_log_dir, exist_ok=True)
-        os.makedirs(self.calibration_out_dir, exist_ok=True)
-        os.makedirs(self.daylight_out_dir, exist_ok=True)
-        os.makedirs(self.masterpiece_archive_dir, exist_ok=True)
-        
-        # dummy = np.zeros((self.cfg["capture"]["height"], self.cfg["capture"]["width"], 3), dtype=np.uint8)
-        # cv2.imwrite(os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.jpg"), dummy)
+        self._validate_output_directories()
  
         # Global stop signal for the entire application
         self.running = threading.Event()
@@ -1841,7 +1844,7 @@ class Pipeline:
             # Only create a blank black canvas if no file exists
             self.nightly_masterpiece = None
             dummy = np.zeros((self.cfg["capture"]["height"], self.cfg["capture"]["width"], 3), dtype=np.uint16)
-            cv2.imwrite(mip_path, dummy)
+            self._safe_save_image(mip_path, dummy)
         
         self.sky_score = 0.0
         self.daylight_mode_active = threading.Event()
@@ -2341,7 +2344,7 @@ class Pipeline:
                     # --- CREATE FRESH CANVAS FOR NEW NIGHT ---
                     self.nightly_masterpiece = None
                     dummy = np.zeros((self.cfg["capture"]["height"], self.cfg["capture"]["width"], 3), dtype=np.uint16)
-                    cv2.imwrite(os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.png"), dummy)
+                    self._safe_save_image(os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.png"), dummy)
                     
                     self.session_stats = {k: (None if k=="start_time" else [] if isinstance(v, list) else 0) for k, v in self.session_stats.items()}
                     self.consecutive_restart_failures = 0
@@ -2958,7 +2961,7 @@ class Pipeline:
                         tstamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = f"calibration_shot_{tstamp}.png"
                         full_path = os.path.join(self.calibration_out_dir, filename)
-                        cv2.imwrite(full_path, stacked_image)
+                        self._safe_save_image(full_path, stacked_image)
                         
                         with self.status_lock:
                             self.last_calibration_image_path = full_path
@@ -3421,7 +3424,7 @@ class Pipeline:
                             debug_dir = os.path.join(self.general_log_dir, "debug_detection")
                             os.makedirs(debug_dir, exist_ok=True)
                             fname = os.path.join(debug_dir, f"det_{datetime.now().strftime('%H%M%S_%f')}.jpg")
-                            cv2.imwrite(fname, debug_img)
+                            self._safe_save_image(fname, debug_img)
                             last_debug_save = now
 
                 # Send via ZMQ
@@ -3492,8 +3495,8 @@ class Pipeline:
                         mip_path = os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.png")
                         temp_mip_path = mip_path + ".tmp.png"
                         
-                        cv2.imwrite(temp_mip_path, self.nightly_masterpiece)
-                        os.replace(temp_mip_path, mip_path)
+                        if self._safe_save_image(temp_mip_path, self.nightly_masterpiece):
+                            os.replace(temp_mip_path, mip_path)
                         logging.debug("Nightly Masterpiece updated with new cosmic path.")
 
                     except Exception as e:
@@ -3668,7 +3671,7 @@ class Pipeline:
                 results = self.analyze_sky_conditions(frame)
                 
                 full_path = os.path.join(self.daylight_out_dir, f"sky_conditions_{today}.png")
-                cv2.imwrite(full_path, frame)
+                self._safe_save_image(full_path, frame)
                 self._tally_data_write(full_path)
                 
                 moon_impact, moon_in_fov, moon_alt, moon_dist = self.get_moon_state()
@@ -4090,8 +4093,7 @@ class Pipeline:
 
                 ts = datetime.now().strftime("%H%M%S")
                 out_path = os.path.join(debug_out_dir, f"debug_stack_roi_{ts}.jpg")
-                # cv2.imwrite(out_path, debug_vis)
-                cv2.imwrite(out_path, (debug_vis >> 8).astype(np.uint8))
+                self._safe_save_image(out_path, (debug_vis >> 8).astype(np.uint8))
 
                 logging.info(f"Saved stack ROI debug image to {out_path}")
 
@@ -4627,7 +4629,7 @@ class Pipeline:
                                     if mosaic is not None:
                                         # Level 2+: Save to disk if directory is set
                                         if stack_dump_dir:
-                                            cv2.imwrite(os.path.join(stack_dump_dir, f"align_{i:03d}_cc{int(cc*100)}.jpg"), mosaic)
+                                            self._safe_save_image(os.path.join(stack_dump_dir, f"align_{i:03d}_cc{int(cc*100)}.jpg"), mosaic)
                                         
                                         # Level 3: Stream over ZMQ
                                         if debug_level >= 3:
@@ -4945,7 +4947,7 @@ class Pipeline:
                     tstamp = datetime.fromisoformat(event_frames[-1][0]).strftime("%Y%m%dT%H%M%SZ")
                     out_name = f"event_stack_{tstamp}.png"
                     full_path = os.path.join(out_dir, out_name)
-                    cv2.imwrite(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                    self._safe_save_image(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
                     self.save_event_stack_metadata(full_path, event_frames, final_method, stack_info)
                     logging.info("Saved event stack image to %s", full_path)
                     
@@ -4989,7 +4991,7 @@ class Pipeline:
                             tstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                             out_name = f"timelapse_final_{tstamp}.png"
                             full_path = os.path.join(self.timelapse_out_dir, out_name)
-                            cv2.imwrite(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                            self._safe_save_image(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
                             self._tally_data_write(full_path)
                             self.save_timelapse_metadata(full_path, final_method, buffer, stack_info)
                     logging.info("Draining complete, exiting.")
@@ -5013,7 +5015,7 @@ class Pipeline:
                     tstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                     out_name = f"timelapse_{tstamp}.png"
                     full_path = os.path.join(self.timelapse_out_dir, out_name)
-                    cv2.imwrite(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                    self._safe_save_image(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
                     logging.info("Saved timelapse stack to %s", full_path)
                     self.save_timelapse_metadata(full_path, final_method, buffer, stack_info)
 
@@ -7824,6 +7826,54 @@ class Pipeline:
     # -----------------
     # 10. UTILITIES & STATIC METHODS
     # -----------------
+    def _safe_save_image(self, filepath, image, params=None):
+        """
+        Safely saves an image to disk, ensuring the directory exists and
+        validating the output.
+        """
+        try:
+            directory = os.path.dirname(filepath)
+            if directory and not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+
+            success = cv2.imwrite(filepath, image, params) if params else cv2.imwrite(filepath, image)
+
+            if success:
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    return True
+                else:
+                    logging.error(f"Image save failed: File {filepath} was reported saved but is missing or empty.")
+            else:
+                logging.error(f"Image save failed: cv2.imwrite returned False for {filepath}")
+
+        except Exception as e:
+            logging.exception(f"Critical error saving image to {filepath}: {e}")
+
+        return False
+
+    def _validate_output_directories(self):
+        """Verifies that all required output directories are writable."""
+        dirs_to_check = [
+            self.events_out_dir,
+            self.timelapse_out_dir,
+            self.daylight_out_dir,
+            self.calibration_out_dir,
+            self.general_log_dir,
+            self.masterpiece_archive_dir
+        ]
+
+        for d in dirs_to_check:
+            try:
+                if not os.path.exists(d):
+                    os.makedirs(d, exist_ok=True)
+
+                if not os.access(d, os.W_OK):
+                    logging.error(f"Directory {d} is NOT writable! Check permissions.")
+                else:
+                    logging.debug(f"Validated directory: {d} is writable.")
+            except Exception as e:
+                logging.error(f"Error validating directory {d}: {e}")
+
     def _enqueue_timelapse_frame(self, ts, frame, meta_label):
         """
         Helper: Enqueues frames for the timelapse worker.
@@ -8103,7 +8153,7 @@ class Pipeline:
             master_dark = master_dark_float.clip(0, 65535).astype(np.uint16)
 
             # 4. Save the final image
-            cv2.imwrite(out_path, master_dark)
+            cv2.imwrite(out_path, master_dark) # Keep direct imwrite in @classmethod
             print(f"\nSUCCESS: Master dark frame saved to '{out_path}'")
             print("You can now add this path to your main config file under the 'detection' section.")
 
@@ -8250,7 +8300,7 @@ if __name__ == '__main__':
             print (f" Total frames: {count} - Acquired:{frames_captured}")
             # avg = (accumulator / count).clip(0, 255).astype(np.uint8)
             avg = (accumulator / frames_captured).clip(0, 65535).astype(np.uint16)
-            cv2.imwrite(out_name, avg)
+            cv2.imwrite(out_name, avg) # Keep direct imwrite in standalone helper
             print(f"\nSaved {desc} to {out_name}")
         else:
             print(f"\nERROR: Failed to capture images for {desc}.")
