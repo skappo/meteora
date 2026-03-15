@@ -391,6 +391,17 @@ class JanitorConfig(BaseModel):
     threshold: float = DEFAULTS["janitor"]["threshold"]
     target: float = DEFAULTS["janitor"]["target"]
     priority_delete: List[str] = DEFAULTS["janitor"]["priority_delete"]
+
+    @field_validator('monitor_path')
+    def validate_monitor_path(cls, v):
+        if not v:
+            raise ValueError("Janitor monitor_path cannot be empty.")
+        if not os.path.exists(v):
+            raise ValueError(f"Janitor monitor_path '{v}' does not exist.")
+        if not os.path.isdir(v):
+            raise ValueError(f"Janitor monitor_path '{v}' is not a directory.")
+        return v
+
     @model_validator(mode='after')
     def validate_disk_logic(self):
         # Ensures that the cleanup trigger threshold is higher than the target cleanup level.
@@ -635,7 +646,7 @@ class CameraCapture:
             logging.warning("Frame capture failed: %s", e)
             return None
             
-    def flush(self, target_exposure_us=None, target_gain=None, max_attempts=15):
+    def flush(self, target_exposure_us=None, target_gain=None, timeout_sec=None):
         """
         Dynamically flushes the exact number of stale frames from the hardware pipeline
         by inspecting the metadata of each frame until it matches the new settings.
@@ -647,8 +658,15 @@ class CameraCapture:
                 except Exception: pass
             return
 
+        # Calculate a safe timeout: 
+        # The time it takes for the NEW exposure to integrate + 30s buffer for the OLD queue
+        if timeout_sec is None:
+            timeout_sec = (target_exposure_us / 1000000.0) * 2.0 + 45.0
+
+        start_time = time.time()
         dropped = 0
-        for _ in range(max_attempts):
+        
+        while time.time() - start_time < timeout_sec:
             try:
                 # capture_request is much faster/lighter than capture_array
                 req = self.picam2.capture_request()
@@ -658,12 +676,12 @@ class CameraCapture:
                 actual_exp = meta.get("ExposureTime", 0)
                 actual_gain = meta.get("AnalogueGain", 0.0)
                 
-                # --- NEW: WIDE TOLERANCE ---
+                # --- WIDE TOLERANCE ---
                 # Allow the hardware driver to round exposure by up to 5%
                 allowed_exp_variance = target_exposure_us * 0.05
 
                 # Check if this frame has our new settings
-                exp_match = abs(actual_exp - target_exposure_us) < allowed_exp_variance  # 1ms tolerance
+                exp_match = abs(actual_exp - target_exposure_us) < allowed_exp_variance
                 gain_match = target_gain is None or abs(actual_gain - target_gain) < 0.5
 
                 if exp_match and gain_match:
@@ -676,7 +694,7 @@ class CameraCapture:
                 logging.warning(f"Camera flush error: {e}")
                 break
                 
-        logging.warning(f"Camera: Flush hit max attempts ({max_attempts}) without confirming sync.")
+        logging.warning(f"Camera: Flush timed out after {timeout_sec:.1f}s without confirming sync. Dropped {dropped} frames.")
 
     def release(self):
         try:
@@ -1728,15 +1746,7 @@ class Pipeline:
         self.camera_k_file = os.path.join(self.general_log_dir, "camera_k.csv")
         self.masterpiece_archive_dir = os.path.join(self.daylight_out_dir, "archive")
  
-        os.makedirs(self.events_out_dir, exist_ok=True)
-        os.makedirs(self.timelapse_out_dir, exist_ok=True)
-        os.makedirs(self.general_log_dir, exist_ok=True)
-        os.makedirs(self.calibration_out_dir, exist_ok=True)
-        os.makedirs(self.daylight_out_dir, exist_ok=True)
-        os.makedirs(self.masterpiece_archive_dir, exist_ok=True)
-        
-        # dummy = np.zeros((self.cfg["capture"]["height"], self.cfg["capture"]["width"], 3), dtype=np.uint8)
-        # cv2.imwrite(os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.jpg"), dummy)
+        self._validate_output_directories()
  
         # Global stop signal for the entire application
         self.running = threading.Event()
@@ -1841,7 +1851,7 @@ class Pipeline:
             # Only create a blank black canvas if no file exists
             self.nightly_masterpiece = None
             dummy = np.zeros((self.cfg["capture"]["height"], self.cfg["capture"]["width"], 3), dtype=np.uint16)
-            cv2.imwrite(mip_path, dummy)
+            self._safe_save_image(mip_path, dummy)
         
         self.sky_score = 0.0
         self.daylight_mode_active = threading.Event()
@@ -1898,6 +1908,7 @@ class Pipeline:
         self.last_daylight_mode = None
         self.background_reset_time = 0
         self.calibration_k = 0.0
+        self.auto_exposure_converged = False
 
         # A list of editable checkbox in the dashboard - enable / disable the relative value in the config file
         self.editable_booleans = ["auto_exposure_tuning", "auto_sensitivity_tuning", "stack_align", "astro_stretch"]
@@ -2341,7 +2352,7 @@ class Pipeline:
                     # --- CREATE FRESH CANVAS FOR NEW NIGHT ---
                     self.nightly_masterpiece = None
                     dummy = np.zeros((self.cfg["capture"]["height"], self.cfg["capture"]["width"], 3), dtype=np.uint16)
-                    cv2.imwrite(os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.png"), dummy)
+                    self._safe_save_image(os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.png"), dummy)
                     
                     self.session_stats = {k: (None if k=="start_time" else [] if isinstance(v, list) else 0) for k, v in self.session_stats.items()}
                     self.consecutive_restart_failures = 0
@@ -2704,7 +2715,7 @@ class Pipeline:
                 if frame is not None and current_lux > 0:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     # median_brightness = np.median(gray)
-                    mean_brightness = float(np.mean(gray)) # Use Mean!
+                    mean_brightness = float(np.mean(gray)) / 256.0  # Use Mean!
                     
                     exposure_sec = hw_exp / 1_000_000.0
                     denominator = (current_lux * exposure_sec * hw_gain)
@@ -2777,34 +2788,67 @@ class Pipeline:
         min_gain, max_gain = cfg["min_gain"], cfg["max_gain"]
         min_exp, max_exp = cfg["min_exposure_us"], cfg["max_exposure_us"]
 
-        # 2. Grab the Hardware Baseline captured milliseconds ago
-        hw_exp = getattr(self, "ae_hw_exposure", self.current_exposure_us)
-        hw_gain = getattr(self, "ae_hw_gain", self.current_gain)
-        hw_bright = getattr(self, "ae_hw_brightness", 1.0)
+        # # 2. Grab the Hardware Baseline captured milliseconds ago
+        # hw_exp = getattr(self, "ae_hw_exposure", self.current_exposure_us)
+        # hw_gain = getattr(self, "ae_hw_gain", self.current_gain)
+        # hw_bright = getattr(self, "ae_hw_brightness", 1.0)
         
-        if hw_bright <= 0.5:
-            hw_bright = 0.5 # Prevent division by zero
+        # if hw_bright <= 0.5:
+            # hw_bright = 0.5 # Prevent division by zero
 
-        # 3. Calculate Correction Ratio
-        # How far off is the hardware's daylight auto-exposure from our night-sky target?
-        ratio = target / hw_bright
+        # # 3. Calculate Correction Ratio
+        # # How far off is the hardware's daylight auto-exposure from our night-sky target?
+        # ratio = target / hw_bright
         
-        # Calculate the new required product (Exposure * Gain)
-        required_product = (hw_exp * hw_gain) * ratio
+        # # Calculate the new required product (Exposure * Gain)
+        # required_product = (hw_exp * hw_gain) * ratio
         
-        # 4. Distribute across Exposure and Gain
-        if required_product > max_exp * min_gain:
-            new_exposure = max_exp
-            new_gain = required_product / max_exp
+        # # 4. Distribute across Exposure and Gain
+        # if required_product > max_exp * min_gain:
+            # new_exposure = max_exp
+            # new_gain = required_product / max_exp
+        # else:
+            # new_exposure = required_product / min_gain
+            # new_gain = min_gain
+
+        # # Clamp initial math guess to hardware limits
+        # new_exposure = int(max(min_exp, min(max_exp, new_exposure)))
+        # new_gain = float(max(min_gain, min(max_gain, new_gain)))
+
+        # 2. Determine Initial Guess
+        if not getattr(self, "auto_exposure_converged", False):
+            # FIRST RUN: Grab the Hardware Baseline captured milliseconds ago
+            hw_exp = getattr(self, "ae_hw_exposure", self.current_exposure_us)
+            hw_gain = getattr(self, "ae_hw_gain", self.current_gain)
+            hw_bright = getattr(self, "ae_hw_brightness", 1.0)
+            
+            if hw_bright <= 0.5:
+                hw_bright = 0.5 # Prevent division by zero
+
+            # Calculate Correction Ratio
+            ratio = target / hw_bright
+            required_product = (hw_exp * hw_gain) * ratio
+            
+            # Distribute across Exposure and Gain
+            if required_product > max_exp * min_gain:
+                new_exposure = max_exp
+                new_gain = required_product / max_exp
+            else:
+                new_exposure = required_product / min_gain
+                new_gain = min_gain
+                
+            logging.info("Auto-exposure: First run of the night. Calculating from hardware baseline.")
         else:
-            new_exposure = required_product / min_gain
-            new_gain = min_gain
+            # SUBSEQUENT RUNS: Start from the last converged values to speed up checks
+            new_exposure = self.current_exposure_us
+            new_gain = self.current_gain
+            logging.info("Auto-exposure: Starting from previous converged values.")
 
         # Clamp initial math guess to hardware limits
         new_exposure = int(max(min_exp, min(max_exp, new_exposure)))
         new_gain = float(max(min_gain, min(max_gain, new_gain)))
 
-        # 4. The Verification Loop
+        # 3. The Verification Loop
         for attempt in range(max_attempts):
             logging.info(f"Auto-exposure Attempt {attempt + 1}/{max_attempts} — Exp: {new_exposure}us | Gain: {new_gain:.2f}")
 
@@ -2835,6 +2879,7 @@ class Pipeline:
                 logging.info(f"Auto-exposure: Target accurately acquired on attempt {attempt + 1}.")
                 self.current_exposure_us = new_exposure
                 self.current_gain = new_gain
+                self.auto_exposure_converged = True
                 return  # Success! Exit immediately.
 
             # --- Check 2: Calculate Correction for Next Attempt ---
@@ -2847,19 +2892,17 @@ class Pipeline:
                         new_gain = max(min_gain, new_gain * 0.5)
                 else:
                     # OFF-TARGET: Proportional ratio correction
-                    correction_ratio = (target / actual_brightness) if actual_brightness > 0 else 2.0
                     
-                    # if correction_ratio > 1.0: # Too dark -> Increase Exposure, then Gain
-                        # if new_exposure < max_exp:
-                            # new_exposure = int(min(max_exp, new_exposure * correction_ratio))
-                        # else:
-                            # new_gain = min(max_gain, new_gain * correction_ratio)
-                    # else: # Too bright -> Decrease Gain, then Exposure
-                        # if new_gain > min_gain:
-                            # new_gain = max(min_gain, new_gain * correction_ratio)
-                        # else:
-                            # new_exposure = int(max(min_exp, new_exposure * correction_ratio))
-
+                    # Prevent division by tiny numbers near the black level clip
+                    safe_brightness = max(actual_brightness, 2.0)
+                    correction_ratio = target / safe_brightness
+                    
+                    # Dampen the correction to prevent wild oscillation jumps
+                    if correction_ratio > 1.0:
+                        correction_ratio = min(correction_ratio, 4.0)  # Max 4x increase per step
+                    else:
+                        correction_ratio = max(correction_ratio, 0.3)  # Max ~3x decrease per step
+                    
                     # --- FIX: Treat Exposure and Gain as a single pooled product ---
                     current_product = new_exposure * new_gain
                     required_product = current_product * correction_ratio
@@ -2878,13 +2921,12 @@ class Pipeline:
             else:
                 # We reached max_attempts without perfectly hitting the target
                 logging.warning(f"Auto-exposure: Max attempts reached. Settling for Brightness={actual_brightness:.1f}")
-                # self.current_exposure_us = new_exposure
-                # self.current_gain = new_gain
+
                 logging.warning(f"Auto-exposure: Max attempts reached without confirmation. Reverting to safe night settings (Exp={safe_night_exp}us, Gain={safe_night_gain:.2f}).")
-                # self.current_exposure_us = int(old_night_exp)
-                # self.current_gain = float(old_night_gain)
+
                 self.current_exposure_us = safe_night_exp
                 self.current_gain = safe_night_gain
+                self.auto_exposure_converged = True
     # -----------------
     def calculate_lux(self, brightness, exposure_us, gain):
         # Formula: Lux = Brightness / (K * Exposure_sec * Gain)
@@ -2958,7 +3000,7 @@ class Pipeline:
                         tstamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = f"calibration_shot_{tstamp}.png"
                         full_path = os.path.join(self.calibration_out_dir, filename)
-                        cv2.imwrite(full_path, stacked_image)
+                        self._safe_save_image(full_path, stacked_image)
                         
                         with self.status_lock:
                             self.last_calibration_image_path = full_path
@@ -2994,15 +3036,20 @@ class Pipeline:
         Central authority for camera hardware.
         Modes: 'NIGHT' (Manual Hunt), 'DAY' (Auto), 'SNAP' (Long Exp Snapshot)
         """
-        # 1. Define the base templates using current config/state
+        # 1. Determine the target exposure first so we can sync FrameDurationLimits
+        target_exp = overrides.get("ExposureTime", self.current_exposure_us)
+        target_gain = overrides.get("AnalogueGain", self.current_gain)
+
+        # 2. Define the base templates using current config/state
         presets = {
             "NIGHT": {
-                "ExposureTime": int(self.current_exposure_us),
-                "AnalogueGain": float(self.current_gain),
+                "ExposureTime": int(target_exp),
+                "AnalogueGain": float(target_gain),
                 "AeEnable": False,
                 "AwbEnable": False,
-                "FrameDurationLimits": (int(self.current_exposure_us), int(self.current_exposure_us)),
-                "ColourGains": [self.cfg["capture"].get("red_gain", 2.0), self.cfg["capture"].get("blue_gain", 1.5)]
+                # --- FIX: Dynamically link FrameDuration to the target exposure ---
+                "FrameDurationLimits": (int(target_exp), int(target_exp)),
+                "ColourGains":[self.cfg["capture"].get("red_gain", 2.0), self.cfg["capture"].get("blue_gain", 1.5)]
             },
             "DAY": {
                 "AeEnable": True, 
@@ -3019,13 +3066,17 @@ class Pipeline:
             }
         }
 
-        # 2. Merge preset with any dynamic overrides (like from Auto Exposure loop)
+        # 3. Merge preset with any dynamic overrides
         controls = {**presets.get(mode, presets["NIGHT"]), **overrides}
         
-#        with self.camera_lock:
+        # --- ULTIMATE SAFETY CHECK ---
+        # Ensure FrameDurationLimits perfectly matches ExposureTime if overridden
+        if mode == "NIGHT" and "ExposureTime" in controls:
+            controls["FrameDurationLimits"] = (int(controls["ExposureTime"]), int(controls["ExposureTime"]))
+
         try:
             if mode != "SNAP":
-                # 3. Synchronize internal state variables if they were changed
+                # 4. Synchronize internal state variables if they were changed
                 if "ExposureTime" in controls:
                     self.current_exposure_us = controls["ExposureTime"]
                 if "AnalogueGain" in controls:
@@ -3038,29 +3089,18 @@ class Pipeline:
             applied_gain = controls.get("AnalogueGain", self.current_gain)
 
             # --- THE METADATA FLUSH ---
-            # If we are in DAY mode, in controls there aren't applied_exp_us and applied_gain so the default are used
-            # is automatically choosing it. So we just flush 4 frames quickly.
             if mode == "DAY":
                 self.camera.flush() # Uses the fallback 4-frame loop
                 logging.info("Preset: Mode DAY applied. (Auto-Exposure Unlocked)")
             else:
-                # --- HYBRID SYNC: Part 1 ---
-                # Wait for the physical exposure time to finish integrating light BEFORE 
-                # we start aggressively pulling frames from the buffer.
+                # Wait for the physical exposure time to finish integrating light
                 settle_time = (applied_exp_us / 1000000.0) + 0.1 
                 time.sleep(settle_time)
                 
-                # --- HYBRID SYNC: Part 2 ---
-                # Now that the light is collected, check the metadata to clear stale frames.
-                # For NIGHT and SNAP, we tell the flush method exactly what Exposure 
-                # to look for. It will pull frames natively until the hardware syncs.
+                # Tell the flush method exactly what Exposure to look for. 
                 self.camera.flush(target_exposure_us=applied_exp_us, target_gain=applied_gain)
                 logging.info(f"Preset: Mode {mode} applied. (Exp: {applied_exp_us}us, Gain: {applied_gain:.2f})")
 
-            # self.camera.flush(target_exposure_us=applied_exp_us, target_gain=applied_gain)
-            
-            # logging.info(f"Preset: Mode {mode} applied. (Exp: {applied_exp_us}us, Gain: {applied_gain:.2f})")
-            # logging.info(f"Preset: Mode {mode} applied. (Exp: {applied_exp_us}us, Gain: {controls.get('AnalogueGain', self.current_gain):.2f})")
             return True
         except Exception as e:
             logging.error(f"Preset: Failed to apply preset {mode}: {e}")
@@ -3421,7 +3461,7 @@ class Pipeline:
                             debug_dir = os.path.join(self.general_log_dir, "debug_detection")
                             os.makedirs(debug_dir, exist_ok=True)
                             fname = os.path.join(debug_dir, f"det_{datetime.now().strftime('%H%M%S_%f')}.jpg")
-                            cv2.imwrite(fname, debug_img)
+                            self._safe_save_image(fname, debug_img)
                             last_debug_save = now
 
                 # Send via ZMQ
@@ -3492,8 +3532,8 @@ class Pipeline:
                         mip_path = os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.png")
                         temp_mip_path = mip_path + ".tmp.png"
                         
-                        cv2.imwrite(temp_mip_path, self.nightly_masterpiece)
-                        os.replace(temp_mip_path, mip_path)
+                        if self._safe_save_image(temp_mip_path, self.nightly_masterpiece):
+                            os.replace(temp_mip_path, mip_path)
                         logging.debug("Nightly Masterpiece updated with new cosmic path.")
 
                     except Exception as e:
@@ -3668,7 +3708,7 @@ class Pipeline:
                 results = self.analyze_sky_conditions(frame)
                 
                 full_path = os.path.join(self.daylight_out_dir, f"sky_conditions_{today}.png")
-                cv2.imwrite(full_path, frame)
+                self._safe_save_image(full_path, frame)
                 self._tally_data_write(full_path)
                 
                 moon_impact, moon_in_fov, moon_alt, moon_dist = self.get_moon_state()
@@ -4039,7 +4079,7 @@ class Pipeline:
         norm_stddev = stddev_val / max(mean_val, 1.0)
 
         # roi_meta = {"stddev": float(stddev[0][0]), "stars_center": 0, "mask": None, "valid": False}
-        roi_meta = {"stddev": stddev_val, "norm_stddev": norm_stddev, "stars_center": 0, "mask": None, "valid": False}
+        roi_meta = {"stddev": stddev_val / 256.0, "norm_stddev": norm_stddev, "stars_center": 0, "mask": None, "valid": False}
 
         # --- Optional mask construction ---
         if star_candidates:
@@ -4090,8 +4130,7 @@ class Pipeline:
 
                 ts = datetime.now().strftime("%H%M%S")
                 out_path = os.path.join(debug_out_dir, f"debug_stack_roi_{ts}.jpg")
-                # cv2.imwrite(out_path, debug_vis)
-                cv2.imwrite(out_path, (debug_vis >> 8).astype(np.uint8))
+                self._safe_save_image(out_path, (debug_vis >> 8).astype(np.uint8))
 
                 logging.info(f"Saved stack ROI debug image to {out_path}")
 
@@ -4420,10 +4459,11 @@ class Pipeline:
                 
                 # Attempt star-mask creation
                 # --- STAR MASK CREATION ---
-                if self.last_sky_status != SkyConditionStatus.CLOUDY:
+                if self.last_sky_status != SkyConditionStatus.CLOUDY and not self.daylight_mode_active.is_set():
                     star_mask, star_meta = create_star_mask(first_frame_gray, min_features=min_features_for_alignment, save_debug=debug_mode, bias_mode=False, debug_out_dir=stack_dump_dir)
                 else: 
-                    logging.info("Alignment skipped: SkyMonitor reports CLOUDY.")
+                    reason = "CLOUDY" if self.last_sky_status == SkyConditionStatus.CLOUDY else "DAYLIGHT"
+                    logging.info(f"Alignment skipped: SkyMonitor reports {reason}.")
                     star_mask = None
                     star_meta = {"stddev": 0}
                 
@@ -4627,7 +4667,7 @@ class Pipeline:
                                     if mosaic is not None:
                                         # Level 2+: Save to disk if directory is set
                                         if stack_dump_dir:
-                                            cv2.imwrite(os.path.join(stack_dump_dir, f"align_{i:03d}_cc{int(cc*100)}.jpg"), mosaic)
+                                            self._safe_save_image(os.path.join(stack_dump_dir, f"align_{i:03d}_cc{int(cc*100)}.jpg"), mosaic)
                                         
                                         # Level 3: Stream over ZMQ
                                         if debug_level >= 3:
@@ -4945,7 +4985,7 @@ class Pipeline:
                     tstamp = datetime.fromisoformat(event_frames[-1][0]).strftime("%Y%m%dT%H%M%SZ")
                     out_name = f"event_stack_{tstamp}.png"
                     full_path = os.path.join(out_dir, out_name)
-                    cv2.imwrite(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                    self._safe_save_image(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
                     self.save_event_stack_metadata(full_path, event_frames, final_method, stack_info)
                     logging.info("Saved event stack image to %s", full_path)
                     
@@ -4989,7 +5029,7 @@ class Pipeline:
                             tstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                             out_name = f"timelapse_final_{tstamp}.png"
                             full_path = os.path.join(self.timelapse_out_dir, out_name)
-                            cv2.imwrite(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                            self._safe_save_image(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
                             self._tally_data_write(full_path)
                             self.save_timelapse_metadata(full_path, final_method, buffer, stack_info)
                     logging.info("Draining complete, exiting.")
@@ -5013,7 +5053,7 @@ class Pipeline:
                     tstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                     out_name = f"timelapse_{tstamp}.png"
                     full_path = os.path.join(self.timelapse_out_dir, out_name)
-                    cv2.imwrite(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                    self._safe_save_image(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
                     logging.info("Saved timelapse stack to %s", full_path)
                     self.save_timelapse_metadata(full_path, final_method, buffer, stack_info)
 
@@ -5176,7 +5216,7 @@ class Pipeline:
         
         meta["sky_status"] = self.last_sky_status.name if self.last_sky_status else "UNKNOWN"
         meta["stack_method"] = method_used 
-        meta["alignment"] = "true" if method_used == "bias mode" else "false"
+        meta["alignment"] = "false" if method_used == "bias mode" else "true"
             
         json_path = img_path.rsplit('.', 1)[0] + ".json"
         self.save_json_atomic(json_path, meta)
@@ -7824,6 +7864,54 @@ class Pipeline:
     # -----------------
     # 10. UTILITIES & STATIC METHODS
     # -----------------
+    def _safe_save_image(self, filepath, image, params=None):
+        """
+        Safely saves an image to disk, ensuring the directory exists and
+        validating the output.
+        """
+        try:
+            directory = os.path.dirname(filepath)
+            if directory and not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+            
+            success = cv2.imwrite(filepath, image, params) if params else cv2.imwrite(filepath, image)
+            
+            if success:
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    return True
+                else:
+                    logging.error(f"Image save failed: File {filepath} was reported saved but is missing or empty.")
+            else:
+                logging.error(f"Image save failed: cv2.imwrite returned False for {filepath}")
+                
+        except Exception as e:
+            logging.exception(f"Critical error saving image to {filepath}: {e}")
+            
+        return False
+
+    def _validate_output_directories(self):
+        """Verifies that all required output directories are writable."""
+        dirs_to_check = [
+            self.events_out_dir,
+            self.timelapse_out_dir,
+            self.daylight_out_dir,
+            self.calibration_out_dir,
+            self.general_log_dir,
+            self.masterpiece_archive_dir
+        ]
+        
+        for d in dirs_to_check:
+            try:
+                if not os.path.exists(d):
+                    os.makedirs(d, exist_ok=True)
+                
+                if not os.access(d, os.W_OK):
+                    logging.error(f"Directory {d} is NOT writable! Check permissions.")
+                else:
+                    logging.debug(f"Validated directory: {d} is writable.")
+            except Exception as e:
+                logging.error(f"Error validating directory {d}: {e}")
+
     def _enqueue_timelapse_frame(self, ts, frame, meta_label):
         """
         Helper: Enqueues frames for the timelapse worker.
@@ -8103,7 +8191,7 @@ class Pipeline:
             master_dark = master_dark_float.clip(0, 65535).astype(np.uint16)
 
             # 4. Save the final image
-            cv2.imwrite(out_path, master_dark)
+            cv2.imwrite(out_path, master_dark) # Keep direct imwrite in @classmethod
             print(f"\nSUCCESS: Master dark frame saved to '{out_path}'")
             print("You can now add this path to your main config file under the 'detection' section.")
 
@@ -8250,7 +8338,7 @@ if __name__ == '__main__':
             print (f" Total frames: {count} - Acquired:{frames_captured}")
             # avg = (accumulator / count).clip(0, 255).astype(np.uint8)
             avg = (accumulator / frames_captured).clip(0, 65535).astype(np.uint16)
-            cv2.imwrite(out_name, avg)
+            cv2.imwrite(out_name, avg) # Keep direct imwrite in standalone helper
             print(f"\nSaved {desc} to {out_name}")
         else:
             print(f"\nERROR: Failed to capture images for {desc}.")
