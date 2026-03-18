@@ -77,7 +77,10 @@ from enum import Enum, auto
 from collections import deque
 from datetime import datetime, timezone, time as dtime
 from logging.handlers import RotatingFileHandler
-from picamera2 import Picamera2
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
 from pydantic import BaseModel, Field, conint, confloat, constr, field_validator, model_validator, ValidationError
 from typing import Tuple, Optional, List
 
@@ -304,7 +307,6 @@ class CaptureConfig(BaseModel):
 
 class DetectionConfig(BaseModel):
     min_area: conint(gt=0,le=255) = DEFAULTS["detection"]["min_area"]
-#    accumulate_alpha: confloat(gt=0, lt=1) = DEFAULTS["detection"]["accumulate_alpha"]
     pre_event_frames: conint(ge=0, le=100) = DEFAULTS["detection"]["pre_event_frames"]
     event_cooldown_frames: conint(ge=0) = DEFAULTS["detection"]["event_cooldown_frames"]
     max_event_frames: conint(ge=0) = DEFAULTS["detection"]["max_event_frames"]
@@ -609,11 +611,9 @@ class CameraCapture:
     def __init__(self, cfg):
         self.cfg = cfg
         self.picam2 = Picamera2()
-        # raw_config = self.picam2.create_still_configuration(raw={"format": "SRGGB10", "size": (cfg['width'], cfg['height'])})
         main_config = self.picam2.create_still_configuration(main={"size": (cfg['width'], cfg['height']), "format": "RGB888"})
         self.picam2.configure(main_config)
 
-#        if not cfg.get("auto_exposure", False):
         red_gain = cfg.get("red_gain", 2.0)
         blue_gain = cfg.get("blue_gain", 1.5)
         
@@ -624,8 +624,6 @@ class CameraCapture:
             "ColourGains": [red_gain, blue_gain]
         }
         self.picam2.set_controls(controls)
-#        else:
-#            self.picam2.set_controls({"AeEnable": True})
 
         self.picam2.start()
         time.sleep(2)
@@ -1032,6 +1030,7 @@ class FrameSimulator:
 
         # Output directly as BGR — no colour conversion needed
         frame_bgr = np.clip(self.frame_buffer, 0, 255).astype(np.uint8)
+        frame_u16 = (frame_bgr.astype(np.uint16) * 256)
 
         # Respect simulated exposure time
         elapsed = time.time() - start
@@ -1039,7 +1038,7 @@ class FrameSimulator:
         if delay > 0.001:
             time.sleep(delay)
 
-        return frame_bgr
+        return frame_u16
 
     def _render_base_sky(self):
         """Fill frame with base sky brightness and atmospheric gradients."""
@@ -1500,15 +1499,14 @@ class FrameSimulator:
     def release(self):
         pass
 
-    def flush(self, count: int = 4):
-        # FIX #17 — respect actual exposure_us, not a magic 0.05 constant
-        time.sleep((self.exposure_us / 1e6) * count)
+    def flush(self, target_exposure_us=None, target_gain=None, timeout_sec=None):
+        """Simulated flush. In the simulator, there is no hardware queue to drain."""
+        pass
     # --------------------------- SFTP connect and upload ---------------------------
 class SFTPUploader:
     def __init__(self, cfg, pipeline_instance):
         self.cfg = cfg
         self.pipeline_instance = pipeline_instance
-        # self.upload_q = queue.Queue()
         self.stop_event = threading.Event()
         self.sftp_password = os.environ.get("SFTP_PASS")
         self.upload_q = queue.Queue(maxsize=cfg.get("max_queue_size", 500)) 
@@ -1760,7 +1758,6 @@ class Pipeline:
         self.worker_threads = []
         self.control_threads = []
 
-        # maxq = cfg["general"].get("max_queue_size", 1000)
         self.acq_q = queue.Queue(maxsize=self.effective_max_q)          # Queue for the acquisition frame
         self.event_q = queue.Queue()                    # Queue for the event frame
         self.timelapse_q = queue.Queue(maxsize=self.effective_max_q)    # Queue for timelapse frame
@@ -1774,9 +1771,6 @@ class Pipeline:
         self.is_calibrating = threading.Event()
         self.is_calibrating.clear()
         self.event_counter = 0
-
-        # self.debug_stack_counter = 0 
-        # self.debug_stack_limit = 5
 
         if args.simulate:
             # Use the fake camera
@@ -2104,16 +2098,22 @@ class Pipeline:
 
         # 2. Add optional control threads based on configuration
               
-        if self.cfg["power_monitor"].get("enabled", False):
+        if self.cfg["power_monitor"].get("enabled", False) and IS_GPIO_AVAILABLE:
             self.control_threads.append(threading.Thread(target=self.power_monitor_loop, name="PowerMonitorThread", daemon=True))
         else:
-            logging.info("Power monitor is disabled in configuration.")
+            if not IS_GPIO_AVAILABLE and self.cfg["power_monitor"].get("enabled", False):
+                logging.warning("Power monitor is enabled but GPIO is not available. Thread will not be started.")
+            else:
+                logging.info("Power monitor is disabled in configuration.")
             self.power_status = "DISABLED"
 
-        if self.cfg["heartbeat"].get("enabled", False):
+        if self.cfg["heartbeat"].get("enabled", False) and self.cfg["heartbeat"].get("url"):
             self.control_threads.append(threading.Thread(target=self.heartbeat_loop, name="HeartbeatThread", daemon=True))
         else:
-            logging.info("Heartbeat is disabled in configuration.")
+            if self.cfg["heartbeat"].get("enabled", False) and not self.cfg["heartbeat"].get("url"):
+                 logging.warning("Heartbeat is enabled but no URL is configured. Thread will not be started.")
+            else:
+                logging.info("Heartbeat is disabled in configuration.")
 
         if self.cfg["ntp"].get("enabled", False):
             self.control_threads.append(threading.Thread(target=self.ntp_sync_loop, name="NTPThread", daemon=True))
@@ -2430,8 +2430,6 @@ class Pipeline:
         mean_lux = np.mean(s["avg_lux"]) if s["avg_lux"] else 0.0
         
         # Calculate derived metrics
-        # eff = 100 - (s["rejected_contours"] / max(1, s["total_events"]) * 100)
-        # total_obs_min = s["clear_sky_minutes"] + s["cloudy_sky_minutes"]
         filtered_noise = s["rejected_contours"]
         actual_captures = s["accepted_events"]
         total_pulsations = s["total_events"]
@@ -2598,7 +2596,6 @@ class Pipeline:
 
         first_run=True
         consecutive_failures = 0
-        # idle_loop_counter = 0
 
         while self.running.is_set() and self.capture_running.is_set():
             
@@ -2609,7 +2606,6 @@ class Pipeline:
                 logging.info("Capture loop started. Max failures: %d. Heartbeat: %d min.", max_failures, heartbeat_min)
                 first_run=False
                       
-            # idle_loop_counter = 0
             ts = datetime.now(timezone.utc).isoformat()
             with self.camera_lock:
                 frame = self.camera.read()
@@ -2640,7 +2636,6 @@ class Pipeline:
         stopping the capture thread.
         """
         lux_threshold = self.cfg.get("daylight", {}).get("lux_threshold", 10.0)
-        # night_cfg = self.cfg["capture"]
         night_exposure_us = self.cfg["capture"].get("exposure_us")
         night_gain = self.cfg["capture"].get("gain")
 
@@ -2714,7 +2709,6 @@ class Pipeline:
                 # Formula: K = Brightness / (Lux * Exposure_sec * Gain)
                 if frame is not None and current_lux > 0:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    # median_brightness = np.median(gray)
                     mean_brightness = float(np.mean(gray)) / 256.0  # Use Mean!
                     
                     exposure_sec = hw_exp / 1_000_000.0
@@ -2789,31 +2783,6 @@ class Pipeline:
         min_exp, max_exp = cfg["min_exposure_us"], cfg["max_exposure_us"]
 
         # # 2. Grab the Hardware Baseline captured milliseconds ago
-        # hw_exp = getattr(self, "ae_hw_exposure", self.current_exposure_us)
-        # hw_gain = getattr(self, "ae_hw_gain", self.current_gain)
-        # hw_bright = getattr(self, "ae_hw_brightness", 1.0)
-        
-        # if hw_bright <= 0.5:
-            # hw_bright = 0.5 # Prevent division by zero
-
-        # # 3. Calculate Correction Ratio
-        # # How far off is the hardware's daylight auto-exposure from our night-sky target?
-        # ratio = target / hw_bright
-        
-        # # Calculate the new required product (Exposure * Gain)
-        # required_product = (hw_exp * hw_gain) * ratio
-        
-        # # 4. Distribute across Exposure and Gain
-        # if required_product > max_exp * min_gain:
-            # new_exposure = max_exp
-            # new_gain = required_product / max_exp
-        # else:
-            # new_exposure = required_product / min_gain
-            # new_gain = min_gain
-
-        # # Clamp initial math guess to hardware limits
-        # new_exposure = int(max(min_exp, min(max_exp, new_exposure)))
-        # new_gain = float(max(min_gain, min(max_gain, new_gain)))
 
         # 2. Determine Initial Guess
         if not getattr(self, "auto_exposure_converged", False):
@@ -3165,7 +3134,6 @@ class Pipeline:
                 f.write("timestamp, k\n")
                 
         try:
-            # ts = datetime.now(timezone.utc).isoformat()
             line = (f"{datetime.now(timezone.utc).isoformat()},{self.calibration_k}\n")
 
             with open(self.camera_k_file, "a") as f:
@@ -3262,7 +3230,6 @@ class Pipeline:
 
             # 1. Dark Subtraction (Integer Math - Fast)
             if self.master_dark is not None:
-                # frame = cv2.subtract(frame, self.master_dark)
                 frame = cv2.subtract(frame, self.master_dark.astype(np.uint16))
 
             # 2. Flat Field Correction (Float Math - Slower but necessary)
@@ -3271,7 +3238,6 @@ class Pipeline:
                     # Convert to float, multiply by gain map, clip, convert back
                     frame_f = frame.astype(np.float32)
                     frame_f = cv2.multiply(frame_f, self.flat_multiplier)
-                    # frame = np.clip(frame_f, 0, 255).astype(np.uint8)
                     frame = np.clip(frame_f, 0, 65535).astype(np.uint16)
                 except Exception:
                     pass # Fallback to uncorrected if dimension mismatch occurs
@@ -3347,61 +3313,25 @@ class Pipeline:
             
             # Only update the background model if we are NOT in an event.
             if not self.event_in_progress.is_set():
-                # cv2.accumulateWeighted(gray, self.background, self.cfg["detection"]["accumulate_alpha"])
                 cv2.accumulateWeighted(gray.astype(np.float32), local_bg, current_alpha)
                  
-            # --- AUTO-THROTTLE ---
             self._enqueue_timelapse_frame(ts, frame, effective_threshold)                   
 
-            # bg = cv2.convertScaleAbs(self.background)
-            # bg = cv2.convertScaleAbs(local_bg)
-            # bg = np.clip(local_bg, 0, 65535).astype(np.uint16)
             bg = local_bg
-            # diff = cv2.absdiff(gray, bg)
             diff = cv2.absdiff(gray.astype(np.float32), bg)
 
-            # Reject tiny / noise-only changes (pre-filter)
-            # | Resolution | Suggested value |
-            # | ---------- | --------------- |
-            # | 640×480    | 10–20           |
-            # | 1280×720   | 20–40           |
-            # | 1920×1080  | 40–80           |
-                       
-            # if self.cfg["capture"]["width"] == 640: min_changes = 10
-            # elif self.cfg["capture"]["width"] == 1280: min_changes = 20
-            # elif self.cfg["capture"]["width"] == 1920: min_changes = 40
-            # else: min_changes = 30
-
-            # # Scale min_changes based on total megapixel count (Dynamic)
-            # megapixels = (self.cfg["capture"]["width"] * self.cfg["capture"]["height"]) / 1_000_000
-            # min_changes = int(megapixels * 25) # Approx 23 for 720p, 52 for 1080p, 300 for HQ
-            
-            # _, th = cv2.threshold(diff, int(effective_threshold), 255, cv2.THRESH_BINARY)
-            # motion_pixels = cv2.countNonZero(th)
-            # #if motion_pixels < min_changes:
-            # if motion_pixels < self.min_changes_required:
-                # continue
-
-            # thr16 = int(effective_threshold) * 256
-            thr16 = int(effective_threshold) * 4
+            thr16 = int(effective_threshold) * 256
             motion_pixels = cv2.countNonZero((diff > thr16).astype("uint8"))
             if motion_pixels < self.min_changes_required:
                 continue
 
-            # _, th = cv2.threshold(diff.astype(np.float32), thr16, 255, cv2.THRESH_BINARY)
             _, th = cv2.threshold(diff, thr16, 255, cv2.THRESH_BINARY)
             th = th.astype(np.uint8)
 
-
-            # --- Use the new effective_threshold in the OpenCV call ---
-            # th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
             th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
                        
             # Finds the contours and creates the 'cnts' variable.
             cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-          								
-            # min_area = self.cfg["detection"].get("min_area", 50)
-            # detected = any(cv2.contourArea(c) >= min_area for c in cnts)
             
             accepted_cnts = 0
             rejection_stats = {"area": 0, "total": len(cnts)}
@@ -3409,7 +3339,6 @@ class Pipeline:
             
             for c in cnts:
                 area = cv2.contourArea(c) 
-                # if area < min_area:
                 if area < self.min_area:
                     rejection_stats["area"] += 1
                     with self.status_lock:
@@ -3421,8 +3350,7 @@ class Pipeline:
              
             if debug_level >= 1:
                 mean_val, std_dev = cv2.meanStdDev(diff)
-                # noise_sigma = float(std_dev[0][0]) / 256.0
-                noise_sigma = float(std_dev[0][0]) / 4.0
+                noise_sigma = float(std_dev[0][0]) / 256.0
                 # Payload construction
                 debug_payload = {"noise_sigma": round(noise_sigma, 2), "threshold": effective_threshold, "contours_total": len(cnts), "contours_accepted": accepted_cnts, "rejected": rejection_stats, "event_active": self.event_in_progress.is_set()}
                 
@@ -3440,7 +3368,6 @@ class Pipeline:
                             return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
                         return img
 
-                    # d1: Original Gray, d2: Diff, d3: Thresh, d4: Frame with Contours
                     d1 = cv2.resize(ensure_color(gray), new_size)
                     d2 = cv2.resize(ensure_color(diff), new_size)
                     d3 = cv2.resize(ensure_color(th), new_size)
@@ -3451,7 +3378,6 @@ class Pipeline:
                     # Stack safely
                     top = np.hstack((d1, d2))
                     bot = np.hstack((d3, d4))
-                    # debug_img = np.vstack((top, bot))
                     debug_img = (np.vstack((top, bot)) >> 8).astype(np.uint8)
                     
                     # Disk Save (Level 2+) for Event Analysis
@@ -3737,7 +3663,6 @@ class Pipeline:
                     # 2. Calculate the Target Threshold (Noise + Moon)
                     base_thr = self.cfg["detection"]["base_threshold"]
                     noise_factor = self.cfg["detection"]["noise_factor"]
-                    # moon_penalty = (40 * moon_impact) if moon_in_fov else (15 * moon_impact)
                     moon_penalty = self.compute_moon_penalty(moon_impact=moon_impact, moon_alt=moon_alt, moon_in_fov=moon_in_fov)
 
                     # This is what the system *wants* the threshold to be
@@ -3803,10 +3728,6 @@ class Pipeline:
                     effective_star_limit = limit_stars
 
                 # 3. Perform the Check
-                # We check results["stddev"] against the dynamic limit
-                # is_clear = (float(results["stddev"]) <= effective_std_limit and results["stars"] >= effective_star_limit)
-                # score = self.compute_sky_score(norm_stddev=results["norm_stddev"], stars=results["stars"], std_limit=effective_std_limit, star_limit=effective_star_limit)
-                # score = self.compute_sky_score(stddev=results["stddev"], stars=results["stars"], std_limit=effective_std_limit, star_limit=effective_star_limit)
                 score = self.compute_sky_score(
                     raw_stddev=results["stddev"],
                     norm_stddev=results["norm_stddev"],
@@ -3829,8 +3750,6 @@ class Pipeline:
                 logging.info(f"SkyScore={score:.2f} | NormSTD={results['norm_stddev']:.4f} | Stars={results['stars']} | MoonPen={moon_penalty:.1f}")
                 logging.info(f"moon_alt={moon_alt:.2f} | moon_in_fov={moon_in_fov}")
                 
-                # # --- Return Detailed Status Instead of a Simple Boolean ---
-                # is_clear = (results["stddev"] <= self.cfg["daylight"]["stddev_threshold"] and results["stars"] >= self.cfg["daylight"]["min_stars"])
 
                 if is_clear:
                     min_stars = self.cfg["daylight"]["min_stars"]
@@ -3885,10 +3804,6 @@ class Pipeline:
         # th_mean, th_stddev = cv2.meanStdDev(tophat)
         th_mean, _ = cv2.meanStdDev(tophat)
         
-        # # Adaptive sigma (cloudy skies need higher sigma)
-        # sigma = 3.0
-        # if th_stddev < 22.0:
-            # sigma = 5.0
 
         # We ensure the threshold is at least 15 to avoid counting black-level noise.
         thresh_val = th_mean[0][0] + (3.0 * raw_stddev)
