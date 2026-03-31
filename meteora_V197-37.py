@@ -6027,6 +6027,12 @@ class Pipeline:
         """
         logging.info("Heartbeat monitor started.")
 
+        try:
+            import requests
+        except ImportError:
+            logging.error("'requests' library is required for the heartbeat feature. Please run 'pip3 install requests'.")
+            return
+
         while self.running.is_set():
             hb_cfg = self.cfg.get("heartbeat", {})
             url = hb_cfg.get("url")
@@ -6038,12 +6044,6 @@ class Pipeline:
                 # If disabled or URL missing during a reload, wait and check again.
                 time.sleep(60)
                 continue
-        
-            try:
-                import requests
-            except ImportError:
-                logging.error("'requests' library is required for the heartbeat feature. Please run 'pip3 install requests'.")
-                return
 
             # 1. Determine the current state and wait interval
             is_active = self.producer_thread_active()
