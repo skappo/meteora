@@ -306,7 +306,7 @@ class CaptureConfig(BaseModel):
         return self
 
 class DetectionConfig(BaseModel):
-    min_area: conint(gt=0,le=255) = DEFAULTS["detection"]["min_area"]
+    min_area: conint(gt=0,le=1000) = DEFAULTS["detection"]["min_area"]
     pre_event_frames: conint(ge=0, le=100) = DEFAULTS["detection"]["pre_event_frames"]
     event_cooldown_frames: conint(ge=0) = DEFAULTS["detection"]["event_cooldown_frames"]
     max_event_frames: conint(ge=0) = DEFAULTS["detection"]["max_event_frames"]
@@ -1582,8 +1582,9 @@ class SFTPUploader:
         q_size = self.upload_q.qsize()
         
         # Check for power loss first, as it's the highest priority status
+        # Note: 'DISABLED' means monitoring is not enabled or supported, so we allow activity.
         with self.pipeline_instance.status_lock:
-            if self.pipeline_instance.power_status != "OK":
+            if self.pipeline_instance.power_status not in ["OK", "DISABLED"]:
                 return ("err", f"Paused (Power Loss) - Queue: {q_size}")
 
         q_max = self.upload_q.maxsize
@@ -1610,7 +1611,7 @@ class SFTPUploader:
         while not self.stop_event.is_set():
 
             # --- PRIORITY 1: CHECK FOR POWER LOSS ---
-            if self.pipeline_instance.power_status != "OK":
+            if self.pipeline_instance.power_status not in ["OK", "DISABLED"]:
                 if not was_paused_by_power_loss:
                     logging.warning("SFTP Uploader: Power loss detected. Pausing all upload activity.")
                     was_paused_by_power_loss = True
@@ -3299,7 +3300,6 @@ class Pipeline:
         recent_frames = deque(maxlen=buffer_frames)
         
         # --- State Management for creating two different packages ---
-#        in_event = False
         current_event_video_frames = []
         current_event_stack_frames = []
         event_cooldown_counter = 0
@@ -3399,17 +3399,6 @@ class Pipeline:
                     debug_payload = {"Daylight_mode": self.daylight_mode_active.is_set(), "weather_hold_active": self.weather_hold_active.is_set()}
                     self.publish_debug("detection_stats", debug_payload, image=debug_img)
                 continue
-                
-				# # Still pass frame to timelapse with the status string
-                # try: 
-                    # self.timelapse_q.put_nowait((ts, frame, threshold_label))
-                    # if debug_level >= 1:
-                        # debug_img = None
-                        # debug_payload = {"Daylight_mode": self.daylight_mode_active.is_set(), "weather_hold_active": self.weather_hold_active.is_set()}
-                        # self.publish_debug("detection_stats", debug_payload, image=debug_img)
-                # except queue.Full: 
-                    # logging.warning("Timelapse queue is full.")
-                # continue               
 
             # --- Detection Logic ---
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -3461,12 +3450,15 @@ class Pipeline:
                 area = cv2.contourArea(c) 
                 if area < self.min_area:
                     rejection_stats["area"] += 1
-                    with self.status_lock:
-                        self.session_stats["rejected_contours"] += 1
                 else:
                     accepted_cnts += 1
             
             detected = (accepted_cnts > 0)
+
+            # --- Update Global Session Stats ---
+            with self.status_lock:
+                self.session_stats["rejected_contours"] += rejection_stats["area"]
+                self.session_stats["total_events"] += raw_contour_count
              
             if debug_level >= 1:
                 mean_val, std_dev = cv2.meanStdDev(diff)
@@ -3527,8 +3519,6 @@ class Pipeline:
                     current_event_stack_frames = [(ts, frame.copy(), effective_threshold)]
                     current_event_frame_count = len(current_event_video_frames)
                     with self.status_lock:
-                        # Track noise: all rejected contours from this event
-                        self.session_stats["rejected_contours"] += rejection_stats["total"]
                         self.session_stats["accepted_events"] += 1
                 else:
                     # --- EVENT CONTINUES ---
@@ -3538,8 +3528,6 @@ class Pipeline:
                     current_event_frame_count += 1
                 
                 event_cooldown_counter = 0 # Reset cooldown on new detection
-                with self.status_lock:
-                    self.session_stats["total_events"] += raw_contour_count
             
             elif self.event_in_progress.is_set():
                 # --- EVENT COOLDOWN ---
@@ -5120,17 +5108,6 @@ class Pipeline:
                 logging.debug("Timelapse: Stack complete. Signaling safe window.")
                 self.timelapse_complete_event.set()
 
-                # if interval_sec > 0:
-                    # # This logic for discarding is fine
-                    # self.timelapse_next_capture_time = time.time() + interval_sec
-                    
-                    # while time.time() < self.timelapse_next_capture_time and self.running.is_set():
-                        # try:
-                            # self.timelapse_q.get(timeout=0.5)
-                        # except queue.Empty:
-                            # # time.sleep(0.1)
-                            # pass
-
                 if self.cfg["general"].get("debug_visualization", False):
                     logging.info(f"Timelapse finished at {time.time()}")
     # -----------------
@@ -6048,26 +6025,26 @@ class Pipeline:
         Crucially, this thread runs INDEPENDENTLY of the main capture schedule
         to signal that the script process is alive at all times.
         """
-        hb_cfg = self.cfg.get("heartbeat", {})
-
-        url = hb_cfg.get("url")
-        active_interval_min = hb_cfg.get("interval_min", 60)
-        # Use a different, potentially longer interval for when the system is idle
-        idle_interval_min = self.cfg["general"].get("idle_heartbeat_interval_min", 120) # e.g., 2 hours
-
-        if not url:
-            logging.warning("Heartbeat is enabled, but no valid URL is configured.")
-            return
-        
-        try:
-            import requests
-        except ImportError:
-            logging.error("'requests' library is required for the heartbeat feature. Please run 'pip3 install requests'.")
-            return
-
-        logging.info(f"Heartbeat monitor started. Will ping every {active_interval_min} min (active) or {idle_interval_min} min (idle).")
+        logging.info("Heartbeat monitor started.")
 
         while self.running.is_set():
+            hb_cfg = self.cfg.get("heartbeat", {})
+            url = hb_cfg.get("url")
+            active_interval_min = hb_cfg.get("interval_min", 60)
+            # Use a different, potentially longer interval for when the system is idle
+            idle_interval_min = self.cfg["general"].get("idle_heartbeat_interval_min", 120) # e.g., 2 hours
+
+            if not url:
+                # If disabled or URL missing during a reload, wait and check again.
+                time.sleep(60)
+                continue
+        
+            try:
+                import requests
+            except ImportError:
+                logging.error("'requests' library is required for the heartbeat feature. Please run 'pip3 install requests'.")
+                return
+
             # 1. Determine the current state and wait interval
             is_active = self.producer_thread_active()
             current_interval_sec = (active_interval_min if is_active else idle_interval_min) * 60
@@ -6101,23 +6078,17 @@ class Pipeline:
         Periodically checks the system clock against an NTP server. If significant
         drift is detected, it triggers the OS's own time service to re-synchronize.
         """
-        ntp_cfg = self.cfg.get("ntp", {})
-
-        server = ntp_cfg.get("server", "pool.ntp.org")
-        interval_sec = ntp_cfg.get("sync_interval_hours", 6) * 3600
-        max_offset = ntp_cfg.get("max_offset_sec", 2.0)
-        
-        logging.info(f"NTP clock monitor started. Will check against '{server}' every {interval_sec / 3600} hours.")
+        logging.info("NTP clock monitor started.")
         time.sleep(60) # Initial delay for network
 
         while self.running.is_set():
             try:
-                
+                ntp_cfg = self.cfg.get("ntp", {})
                 server = ntp_cfg.get("server", "pool.ntp.org")
                 interval_sec = ntp_cfg.get("sync_interval_hours", 6) * 3600
-                max_offset = ntp_cfg.get("max_offset_sec", 2.0)                
-                
-                logging.info("Performing periodic NTP clock check...")
+                max_offset = ntp_cfg.get("max_offset_sec", 2.0)
+
+                logging.info("Performing periodic NTP clock check against '%s'...", server)
                 client = ntplib.NTPClient()
                 response = client.request(server, version=3, timeout=15)
                 offset = response.offset
