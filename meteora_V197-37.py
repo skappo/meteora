@@ -77,7 +77,10 @@ from enum import Enum, auto
 from collections import deque
 from datetime import datetime, timezone, time as dtime
 from logging.handlers import RotatingFileHandler
-from picamera2 import Picamera2
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
 from pydantic import BaseModel, Field, conint, confloat, constr, field_validator, model_validator, ValidationError
 from typing import Tuple, Optional, List
 
@@ -222,7 +225,7 @@ DEFAULTS = {
         "max_offset_sec": 2.0
     },
     "general": {
-        "version": "197.17",
+        "version": "197.47",
         "debug_level": 0,
         "debug_visualization": False,
         "record_raw_frames": False,
@@ -304,7 +307,6 @@ class CaptureConfig(BaseModel):
 
 class DetectionConfig(BaseModel):
     min_area: conint(gt=0,le=255) = DEFAULTS["detection"]["min_area"]
-#    accumulate_alpha: confloat(gt=0, lt=1) = DEFAULTS["detection"]["accumulate_alpha"]
     pre_event_frames: conint(ge=0, le=100) = DEFAULTS["detection"]["pre_event_frames"]
     event_cooldown_frames: conint(ge=0) = DEFAULTS["detection"]["event_cooldown_frames"]
     max_event_frames: conint(ge=0) = DEFAULTS["detection"]["max_event_frames"]
@@ -609,11 +611,9 @@ class CameraCapture:
     def __init__(self, cfg):
         self.cfg = cfg
         self.picam2 = Picamera2()
-        # raw_config = self.picam2.create_still_configuration(raw={"format": "SRGGB10", "size": (cfg['width'], cfg['height'])})
         main_config = self.picam2.create_still_configuration(main={"size": (cfg['width'], cfg['height']), "format": "RGB888"})
         self.picam2.configure(main_config)
 
-#        if not cfg.get("auto_exposure", False):
         red_gain = cfg.get("red_gain", 2.0)
         blue_gain = cfg.get("blue_gain", 1.5)
         
@@ -624,8 +624,6 @@ class CameraCapture:
             "ColourGains": [red_gain, blue_gain]
         }
         self.picam2.set_controls(controls)
-#        else:
-#            self.picam2.set_controls({"AeEnable": True})
 
         self.picam2.start()
         time.sleep(2)
@@ -1032,6 +1030,7 @@ class FrameSimulator:
 
         # Output directly as BGR — no colour conversion needed
         frame_bgr = np.clip(self.frame_buffer, 0, 255).astype(np.uint8)
+        frame_u16 = (frame_bgr.astype(np.uint16) * 256)
 
         # Respect simulated exposure time
         elapsed = time.time() - start
@@ -1039,7 +1038,7 @@ class FrameSimulator:
         if delay > 0.001:
             time.sleep(delay)
 
-        return frame_bgr
+        return frame_u16
 
     def _render_base_sky(self):
         """Fill frame with base sky brightness and atmospheric gradients."""
@@ -1500,15 +1499,14 @@ class FrameSimulator:
     def release(self):
         pass
 
-    def flush(self, count: int = 4):
-        # FIX #17 — respect actual exposure_us, not a magic 0.05 constant
-        time.sleep((self.exposure_us / 1e6) * count)
+    def flush(self, target_exposure_us=None, target_gain=None, timeout_sec=None):
+        """Simulated flush. In the simulator, there is no hardware queue to drain."""
+        pass
     # --------------------------- SFTP connect and upload ---------------------------
 class SFTPUploader:
     def __init__(self, cfg, pipeline_instance):
         self.cfg = cfg
         self.pipeline_instance = pipeline_instance
-        # self.upload_q = queue.Queue()
         self.stop_event = threading.Event()
         self.sftp_password = os.environ.get("SFTP_PASS")
         self.upload_q = queue.Queue(maxsize=cfg.get("max_queue_size", 500)) 
@@ -1760,7 +1758,6 @@ class Pipeline:
         self.worker_threads = []
         self.control_threads = []
 
-        # maxq = cfg["general"].get("max_queue_size", 1000)
         self.acq_q = queue.Queue(maxsize=self.effective_max_q)          # Queue for the acquisition frame
         self.event_q = queue.Queue()                    # Queue for the event frame
         self.timelapse_q = queue.Queue(maxsize=self.effective_max_q)    # Queue for timelapse frame
@@ -1774,9 +1771,6 @@ class Pipeline:
         self.is_calibrating = threading.Event()
         self.is_calibrating.clear()
         self.event_counter = 0
-
-        # self.debug_stack_counter = 0 
-        # self.debug_stack_limit = 5
 
         if args.simulate:
             # Use the fake camera
@@ -1839,7 +1833,8 @@ class Pipeline:
             logging.info("ZMQ port 5555 already in use. Debug publisher disabled.")
 
         self.last_night_journal = "Initial sequence started. The first chronicle will be written at sunrise."
-        self.session_stats = self._reset_session_stats()            
+        self.session_stats = self._reset_session_stats()  
+        self.night_chronicle = self._load_chronicle()
         
         # The Master Canvas: Persistent Maximum Intensity Projection (MIP).
         mip_path = os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.png")
@@ -1982,9 +1977,104 @@ class Pipeline:
             "moon_visible_minutes": 0,
             "data_written_mb": 0.0,
             "peak_cpu_temp": 0.0,
-            "avg_lux": []
+            "avg_lux": [],
+            "sky_history": []
         }
     # -----------------
+    def _load_chronicle(self):
+        path = os.path.join(self.general_log_dir, "night_chronicle.json")
+        try:
+            if os.path.exists(path):
+                with open(path) as f:
+                    data = json.load(f)
+                logging.info("Night Chronicle loaded: %d nights on record.", len(data))
+                return data
+        except Exception as e:
+            logging.warning("Could not load night chronicle: %s", e)
+        return []
+    # -----------------
+    def _update_chronicle(self, s, hours, sky_avg, clarity, sky_history):
+        record = {
+            "date": s["start_time"].strftime("%Y-%m-%d"),
+            "hours_watched": round(hours, 2),
+            "events_accepted": s["accepted_events"],
+            "clarity_pct": round(clarity, 1),
+            "sky_score_avg": round(sky_avg, 3),
+            "peak_temp_c": round(s["peak_cpu_temp"], 1),
+            "max_moon_impact": round(s["max_moon_impact"], 3),
+            "data_written_mb": round(s["data_written_mb"], 1),
+            "sky_trend": self._generate_atmosphere_fingerprint(sky_history).get("trend", "stable"),
+        }
+        # Avoid duplicate dates
+        self.night_chronicle = [n for n in self.night_chronicle if n["date"] != record["date"]]
+        self.night_chronicle.append(record)
+        # Keep last 365 nights
+        self.night_chronicle = self.night_chronicle[-365:]
+        path = os.path.join(self.general_log_dir, "night_chronicle.json")
+        self.save_json_atomic(path, self.night_chronicle)
+        logging.info("Night Chronicle updated. Total nights on record: %d", len(self.night_chronicle))
+    # -----------------
+    def _get_chronicle_context(self):
+        """Returns percentile ranks and historical comparisons for tonight."""
+        c = self.night_chronicle
+        if len(c) < 2:
+            return {}
+        s = self.session_stats
+        all_events = [n["events_accepted"] for n in c]
+        all_clarity = [n["clarity_pct"] for n in c]
+        all_scores  = [n["sky_score_avg"] for n in c]
+        tonight_events  = s["accepted_events"]
+        tonight_clarity = (s["clear_sky_minutes"] / max(1, s["clear_sky_minutes"] + s["cloudy_sky_minutes"]) * 100)
+        tonight_score   = float(np.mean(s["avg_sky_score"])) if s["avg_sky_score"] else 0.0
+        def percentile_rank(val, lst):
+            return round(sum(1 for x in lst if x <= val) / len(lst) * 100)
+        return {
+            "nights_total":    len(c),
+            "events_avg":      round(np.mean(all_events), 1),
+            "events_tonight":  tonight_events,
+            "events_pct":      percentile_rank(tonight_events, all_events),
+            "events_record":   max(all_events),
+            "clarity_avg":     round(np.mean(all_clarity), 1),
+            "clarity_tonight": round(tonight_clarity, 1),
+            "clarity_pct":     percentile_rank(tonight_clarity, all_clarity),
+            "score_avg":       round(np.mean(all_scores), 3),
+            "score_tonight":   round(tonight_score, 3),
+            "score_pct":       percentile_rank(tonight_score, all_scores),
+        }
+    # -----------------
+    def _generate_atmosphere_fingerprint(self, sky_history):
+        """Analyses the intra-night sky quality trend from sky_history snapshots."""
+        if len(sky_history) < 2:
+            return {"trend": "stable", "summary": "Insufficient sky checks for trend analysis.", "sparkline": []}
+        scores = [h["score"] for h in sky_history]
+        times  = [h["t"]     for h in sky_history]
+        # Linear slope via least-squares
+        n  = len(scores)
+        t0 = times[0]
+        xs = [(t - t0) / 3600.0 for t in times]  # hours from session start
+        mx = sum(xs) / n;  my = sum(scores) / n
+        num = sum((xs[i] - mx) * (scores[i] - my) for i in range(n))
+        den = sum((xs[i] - mx) ** 2 for i in range(n))
+        slope = num / den if den > 0 else 0.0
+        # Classify
+        if slope >  0.08:  trend = "improving";  verb = "steadily improved"
+        elif slope < -0.08: trend = "degrading";  verb = "gradually degraded"
+        else:               trend = "stable";     verb = "remained stable"
+        best  = max(sky_history, key=lambda h: h["score"])
+        worst = min(sky_history, key=lambda h: h["score"])
+        best_t  = datetime.fromtimestamp(best["t"],  tz=timezone.utc).strftime("%H:%M")
+        worst_t = datetime.fromtimestamp(worst["t"], tz=timezone.utc).strftime("%H:%M")
+        summary = (
+            f"Atmospheric quality {verb} through the session "
+            f"(slope {slope:+.2f}/hr). "
+            f"Peak transparency: score {best['score']:.2f} at {best_t} UTC "
+            f"({best['stars']} stars, stddev {best['stddev']:.1f}). "
+            f"Worst moment: score {worst['score']:.2f} at {worst_t} UTC."
+        )
+        return {"trend": trend, "slope": round(slope, 3), "summary": summary,
+                "sparkline": [round(s, 2) for s in scores], "best": best, "worst": worst}
+    # -----------------
+
     def _apply_resolution_aware_tuning(self):
         """Automatically optimizes logic variables based on the total pixel count."""
         w = self.cfg["capture"]["width"]
@@ -2074,6 +2164,16 @@ class Pipeline:
     # -----------------
     def start(self):
         logging.info("Starting all pipeline services...")
+
+        if self.cfg.get("detection", {}).get("auto_sensitivity_tuning", False):
+            gen_cfg = self.cfg.get("general", {})
+            logging.info("Auto-Sensitivity Tuning is ENABLED. Lunar awareness active.")
+            logging.info("Site location: %s", gen_cfg.get("location", "Unknown"))
+            logging.info("  -> Coordinates : Lat %.4f, Lon %.4f", gen_cfg.get("latitude", 0.0), gen_cfg.get("longitude", 0.0))
+            logging.info("  -> Camera Point: Azimuth %.1f°, Altitude %.1f°", gen_cfg.get("camera_azimuth", 0.0), gen_cfg.get("camera_altitude", 90.0))
+        else:
+            logging.info("Auto-Sensitivity Tuning is DISABLED. Using static thresholds.")
+
         power_pin = self.cfg["general"].get("power_monitor_pin", 17)
 
         self.worker_threads = [
@@ -2104,16 +2204,22 @@ class Pipeline:
 
         # 2. Add optional control threads based on configuration
               
-        if self.cfg["power_monitor"].get("enabled", False):
+        if self.cfg["power_monitor"].get("enabled", False) and IS_GPIO_AVAILABLE:
             self.control_threads.append(threading.Thread(target=self.power_monitor_loop, name="PowerMonitorThread", daemon=True))
         else:
-            logging.info("Power monitor is disabled in configuration.")
+            if not IS_GPIO_AVAILABLE and self.cfg["power_monitor"].get("enabled", False):
+                logging.warning("Power monitor is enabled but GPIO is not available. Thread will not be started.")
+            else:
+                logging.info("Power monitor is disabled in configuration.")
             self.power_status = "DISABLED"
 
-        if self.cfg["heartbeat"].get("enabled", False):
+        if self.cfg["heartbeat"].get("enabled", False) and self.cfg["heartbeat"].get("url"):
             self.control_threads.append(threading.Thread(target=self.heartbeat_loop, name="HeartbeatThread", daemon=True))
         else:
-            logging.info("Heartbeat is disabled in configuration.")
+            if self.cfg["heartbeat"].get("enabled", False) and not self.cfg["heartbeat"].get("url"):
+                 logging.warning("Heartbeat is enabled but no URL is configured. Thread will not be started.")
+            else:
+                logging.info("Heartbeat is disabled in configuration.")
 
         if self.cfg["ntp"].get("enabled", False):
             self.control_threads.append(threading.Thread(target=self.ntp_sync_loop, name="NTPThread", daemon=True))
@@ -2430,14 +2536,16 @@ class Pipeline:
         mean_lux = np.mean(s["avg_lux"]) if s["avg_lux"] else 0.0
         
         # Calculate derived metrics
-        # eff = 100 - (s["rejected_contours"] / max(1, s["total_events"]) * 100)
-        # total_obs_min = s["clear_sky_minutes"] + s["cloudy_sky_minutes"]
         filtered_noise = s["rejected_contours"]
         actual_captures = s["accepted_events"]
         total_pulsations = s["total_events"]
         
         clarity = (s["clear_sky_minutes"] / max(1, s["clear_sky_minutes"] + s["cloudy_sky_minutes"]) * 100)
         sky_avg = np.mean(s["avg_sky_score"]) if s["avg_sky_score"] else 0.0
+
+        fp  = self._generate_atmosphere_fingerprint(s.get("sky_history", []))
+        ctx = self._get_chronicle_context()
+        self._update_chronicle(s, hours, sky_avg, clarity, s.get("sky_history", []))
 
         eff = 100.0
         if total_pulsations > 0:
@@ -2463,6 +2571,17 @@ class Pipeline:
             # lines.append(f"• DATA SYNC: {s['sftp_success_count']} files successfully transmitted to the remote archive.")
 
         lines.append(f"• VITALS: Peak operating temperature: {s['peak_cpu_temp']:.1f}°C.")
+        
+        lines.append(f"• ATMOSPHERE: {fp['summary']}")
+        if ctx:
+            lines.append(
+                f"• CHRONICLE ({ctx['nights_total']} nights): "
+                f"Tonight's {ctx['events_tonight']} events ranks in the "
+                f"{ctx['events_pct']}th percentile (avg {ctx['events_avg']:.1f}, "
+                f"record {ctx['events_record']}). "
+                f"Sky quality {ctx['score_pct']}th percentile."
+            )
+        
         lines.append("-" * 60)
         lines.append("I am now resting. Monitoring the atmosphere for the next start.")
 
@@ -2598,7 +2717,6 @@ class Pipeline:
 
         first_run=True
         consecutive_failures = 0
-        # idle_loop_counter = 0
 
         while self.running.is_set() and self.capture_running.is_set():
             
@@ -2609,7 +2727,6 @@ class Pipeline:
                 logging.info("Capture loop started. Max failures: %d. Heartbeat: %d min.", max_failures, heartbeat_min)
                 first_run=False
                       
-            # idle_loop_counter = 0
             ts = datetime.now(timezone.utc).isoformat()
             with self.camera_lock:
                 frame = self.camera.read()
@@ -2640,7 +2757,6 @@ class Pipeline:
         stopping the capture thread.
         """
         lux_threshold = self.cfg.get("daylight", {}).get("lux_threshold", 10.0)
-        # night_cfg = self.cfg["capture"]
         night_exposure_us = self.cfg["capture"].get("exposure_us")
         night_gain = self.cfg["capture"].get("gain")
 
@@ -2714,7 +2830,6 @@ class Pipeline:
                 # Formula: K = Brightness / (Lux * Exposure_sec * Gain)
                 if frame is not None and current_lux > 0:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    # median_brightness = np.median(gray)
                     mean_brightness = float(np.mean(gray)) / 256.0  # Use Mean!
                     
                     exposure_sec = hw_exp / 1_000_000.0
@@ -2789,31 +2904,6 @@ class Pipeline:
         min_exp, max_exp = cfg["min_exposure_us"], cfg["max_exposure_us"]
 
         # # 2. Grab the Hardware Baseline captured milliseconds ago
-        # hw_exp = getattr(self, "ae_hw_exposure", self.current_exposure_us)
-        # hw_gain = getattr(self, "ae_hw_gain", self.current_gain)
-        # hw_bright = getattr(self, "ae_hw_brightness", 1.0)
-        
-        # if hw_bright <= 0.5:
-            # hw_bright = 0.5 # Prevent division by zero
-
-        # # 3. Calculate Correction Ratio
-        # # How far off is the hardware's daylight auto-exposure from our night-sky target?
-        # ratio = target / hw_bright
-        
-        # # Calculate the new required product (Exposure * Gain)
-        # required_product = (hw_exp * hw_gain) * ratio
-        
-        # # 4. Distribute across Exposure and Gain
-        # if required_product > max_exp * min_gain:
-            # new_exposure = max_exp
-            # new_gain = required_product / max_exp
-        # else:
-            # new_exposure = required_product / min_gain
-            # new_gain = min_gain
-
-        # # Clamp initial math guess to hardware limits
-        # new_exposure = int(max(min_exp, min(max_exp, new_exposure)))
-        # new_gain = float(max(min_gain, min(max_gain, new_gain)))
 
         # 2. Determine Initial Guess
         if not getattr(self, "auto_exposure_converged", False):
@@ -3047,7 +3137,6 @@ class Pipeline:
                 "AnalogueGain": float(target_gain),
                 "AeEnable": False,
                 "AwbEnable": False,
-                # --- FIX: Dynamically link FrameDuration to the target exposure ---
                 "FrameDurationLimits": (int(target_exp), int(target_exp)),
                 "ColourGains":[self.cfg["capture"].get("red_gain", 2.0), self.cfg["capture"].get("blue_gain", 1.5)]
             },
@@ -3165,7 +3254,6 @@ class Pipeline:
                 f.write("timestamp, k\n")
                 
         try:
-            # ts = datetime.now(timezone.utc).isoformat()
             line = (f"{datetime.now(timezone.utc).isoformat()},{self.calibration_k}\n")
 
             with open(self.camera_k_file, "a") as f:
@@ -3262,7 +3350,6 @@ class Pipeline:
 
             # 1. Dark Subtraction (Integer Math - Fast)
             if self.master_dark is not None:
-                # frame = cv2.subtract(frame, self.master_dark)
                 frame = cv2.subtract(frame, self.master_dark.astype(np.uint16))
 
             # 2. Flat Field Correction (Float Math - Slower but necessary)
@@ -3271,7 +3358,6 @@ class Pipeline:
                     # Convert to float, multiply by gain map, clip, convert back
                     frame_f = frame.astype(np.float32)
                     frame_f = cv2.multiply(frame_f, self.flat_multiplier)
-                    # frame = np.clip(frame_f, 0, 255).astype(np.uint8)
                     frame = np.clip(frame_f, 0, 65535).astype(np.uint16)
                 except Exception:
                     pass # Fallback to uncorrected if dimension mismatch occurs
@@ -3347,61 +3433,25 @@ class Pipeline:
             
             # Only update the background model if we are NOT in an event.
             if not self.event_in_progress.is_set():
-                # cv2.accumulateWeighted(gray, self.background, self.cfg["detection"]["accumulate_alpha"])
                 cv2.accumulateWeighted(gray.astype(np.float32), local_bg, current_alpha)
                  
-            # --- AUTO-THROTTLE ---
             self._enqueue_timelapse_frame(ts, frame, effective_threshold)                   
 
-            # bg = cv2.convertScaleAbs(self.background)
-            # bg = cv2.convertScaleAbs(local_bg)
-            # bg = np.clip(local_bg, 0, 65535).astype(np.uint16)
             bg = local_bg
-            # diff = cv2.absdiff(gray, bg)
             diff = cv2.absdiff(gray.astype(np.float32), bg)
 
-            # Reject tiny / noise-only changes (pre-filter)
-            # | Resolution | Suggested value |
-            # | ---------- | --------------- |
-            # | 640×480    | 10–20           |
-            # | 1280×720   | 20–40           |
-            # | 1920×1080  | 40–80           |
-                       
-            # if self.cfg["capture"]["width"] == 640: min_changes = 10
-            # elif self.cfg["capture"]["width"] == 1280: min_changes = 20
-            # elif self.cfg["capture"]["width"] == 1920: min_changes = 40
-            # else: min_changes = 30
-
-            # # Scale min_changes based on total megapixel count (Dynamic)
-            # megapixels = (self.cfg["capture"]["width"] * self.cfg["capture"]["height"]) / 1_000_000
-            # min_changes = int(megapixels * 25) # Approx 23 for 720p, 52 for 1080p, 300 for HQ
-            
-            # _, th = cv2.threshold(diff, int(effective_threshold), 255, cv2.THRESH_BINARY)
-            # motion_pixels = cv2.countNonZero(th)
-            # #if motion_pixels < min_changes:
-            # if motion_pixels < self.min_changes_required:
-                # continue
-
-            # thr16 = int(effective_threshold) * 256
-            thr16 = int(effective_threshold) * 4
+            thr16 = int(effective_threshold) * 256
             motion_pixels = cv2.countNonZero((diff > thr16).astype("uint8"))
             if motion_pixels < self.min_changes_required:
                 continue
 
-            # _, th = cv2.threshold(diff.astype(np.float32), thr16, 255, cv2.THRESH_BINARY)
             _, th = cv2.threshold(diff, thr16, 255, cv2.THRESH_BINARY)
             th = th.astype(np.uint8)
 
-
-            # --- Use the new effective_threshold in the OpenCV call ---
-            # th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
             th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
                        
             # Finds the contours and creates the 'cnts' variable.
             cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-          								
-            # min_area = self.cfg["detection"].get("min_area", 50)
-            # detected = any(cv2.contourArea(c) >= min_area for c in cnts)
             
             accepted_cnts = 0
             rejection_stats = {"area": 0, "total": len(cnts)}
@@ -3409,7 +3459,6 @@ class Pipeline:
             
             for c in cnts:
                 area = cv2.contourArea(c) 
-                # if area < min_area:
                 if area < self.min_area:
                     rejection_stats["area"] += 1
                     with self.status_lock:
@@ -3421,8 +3470,7 @@ class Pipeline:
              
             if debug_level >= 1:
                 mean_val, std_dev = cv2.meanStdDev(diff)
-                # noise_sigma = float(std_dev[0][0]) / 256.0
-                noise_sigma = float(std_dev[0][0]) / 4.0
+                noise_sigma = float(std_dev[0][0]) / 256.0
                 # Payload construction
                 debug_payload = {"noise_sigma": round(noise_sigma, 2), "threshold": effective_threshold, "contours_total": len(cnts), "contours_accepted": accepted_cnts, "rejected": rejection_stats, "event_active": self.event_in_progress.is_set()}
                 
@@ -3440,7 +3488,6 @@ class Pipeline:
                             return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
                         return img
 
-                    # d1: Original Gray, d2: Diff, d3: Thresh, d4: Frame with Contours
                     d1 = cv2.resize(ensure_color(gray), new_size)
                     d2 = cv2.resize(ensure_color(diff), new_size)
                     d3 = cv2.resize(ensure_color(th), new_size)
@@ -3451,7 +3498,6 @@ class Pipeline:
                     # Stack safely
                     top = np.hstack((d1, d2))
                     bot = np.hstack((d3, d4))
-                    # debug_img = np.vstack((top, bot))
                     debug_img = (np.vstack((top, bot)) >> 8).astype(np.uint8)
                     
                     # Disk Save (Level 2+) for Event Analysis
@@ -3737,7 +3783,6 @@ class Pipeline:
                     # 2. Calculate the Target Threshold (Noise + Moon)
                     base_thr = self.cfg["detection"]["base_threshold"]
                     noise_factor = self.cfg["detection"]["noise_factor"]
-                    # moon_penalty = (40 * moon_impact) if moon_in_fov else (15 * moon_impact)
                     moon_penalty = self.compute_moon_penalty(moon_impact=moon_impact, moon_alt=moon_alt, moon_in_fov=moon_in_fov)
 
                     # This is what the system *wants* the threshold to be
@@ -3803,10 +3848,6 @@ class Pipeline:
                     effective_star_limit = limit_stars
 
                 # 3. Perform the Check
-                # We check results["stddev"] against the dynamic limit
-                # is_clear = (float(results["stddev"]) <= effective_std_limit and results["stars"] >= effective_star_limit)
-                # score = self.compute_sky_score(norm_stddev=results["norm_stddev"], stars=results["stars"], std_limit=effective_std_limit, star_limit=effective_star_limit)
-                # score = self.compute_sky_score(stddev=results["stddev"], stars=results["stars"], std_limit=effective_std_limit, star_limit=effective_star_limit)
                 score = self.compute_sky_score(
                     raw_stddev=results["stddev"],
                     norm_stddev=results["norm_stddev"],
@@ -3825,12 +3866,16 @@ class Pipeline:
                 self.session_stats["avg_sky_score"].append(score)
                 self.sky_score = score
                 is_clear = score >= 0.8   # normally it was 1
+                
+                self.session_stats["sky_history"].append({
+                    "t": time.time(), "score": round(score, 3),
+                    "stddev": round(float(results["stddev"]), 2),
+                    "stars": int(results["stars"])
+                })
 
                 logging.info(f"SkyScore={score:.2f} | NormSTD={results['norm_stddev']:.4f} | Stars={results['stars']} | MoonPen={moon_penalty:.1f}")
                 logging.info(f"moon_alt={moon_alt:.2f} | moon_in_fov={moon_in_fov}")
                 
-                # # --- Return Detailed Status Instead of a Simple Boolean ---
-                # is_clear = (results["stddev"] <= self.cfg["daylight"]["stddev_threshold"] and results["stars"] >= self.cfg["daylight"]["min_stars"])
 
                 if is_clear:
                     min_stars = self.cfg["daylight"]["min_stars"]
@@ -3885,10 +3930,6 @@ class Pipeline:
         # th_mean, th_stddev = cv2.meanStdDev(tophat)
         th_mean, _ = cv2.meanStdDev(tophat)
         
-        # # Adaptive sigma (cloudy skies need higher sigma)
-        # sigma = 3.0
-        # if th_stddev < 22.0:
-            # sigma = 5.0
 
         # We ensure the threshold is at least 15 to avoid counting black-level noise.
         thresh_val = th_mean[0][0] + (3.0 * raw_stddev)
@@ -4196,9 +4237,9 @@ class Pipeline:
 
                     # CAN REMOVE...?
                     # Early reject: no texture → no stars
-                    if stddev < 0.2:   # 2 lower for cleaner/darker skies
+                    if (stddev / 256.0) < 0.2:   # 2 lower for cleaner/darker skies
                         #return None
-                        return None, {"reason": "early_reject", "stddev": stddev}
+                        return None, {"reason": "early_reject", "stddev": stddev / 256.0}
 
                     # h, w = gray_img.shape
 
@@ -4241,7 +4282,7 @@ class Pipeline:
 
                     if len(candidates) < min_features:
                         #return None
-                        return None, {"reason": "early_reject", "stddev": stddev}
+                        return None, {"reason": "early_reject", "stddev": stddev / 256.0}
 
                     # -------------------------------------------------
                     # 3. Sort by brightness
@@ -4254,13 +4295,13 @@ class Pipeline:
                     _, _, _, _, _, _, roi_meta = self._compute_roi_stats(gray_img, blur=False, star_candidates=top_stars, radius=radius, min_features=min_features, save_debug=save_debug, debug_out_dir=debug_out_dir)    # ok
 
                     if not roi_meta["valid"]:
-                        return None, {"reason": "early_reject", "stddev": stddev}
+                        return None, {"reason": "early_reject", "stddev": stddev / 256.0}
 
-                    return roi_meta["mask"], {"candidates": len(candidates), "stars_center": roi_meta["stars_center"], "stddev": stddev}
+                    return roi_meta["mask"], {"candidates": len(candidates), "stars_center": roi_meta["stars_center"], "stddev": roi_meta["stddev"]}
 
                 except Exception as e:
                     logging.error(f"Mask generation error: {e}")
-                    return None, {"reason": "early_reject", "stddev": float(stddev)}
+                    return None, {"reason": "early_reject", "stddev": float(stddev) / 256.0}
 
 #----------------------
 
@@ -4836,15 +4877,27 @@ class Pipeline:
             return 0.0, False, 0.0, 180.0
     # -----------------
     def get_cosmic_narrative(self, score, stars, moon_up):
+        ctx = self._get_chronicle_context()
+        ep  = ctx.get("events_pct", 50) if ctx else 50
+        trend = ""
+        if self.session_stats.get("sky_history"):
+            fp = self._generate_atmosphere_fingerprint(self.session_stats["sky_history"])
+            if fp["trend"] == "improving":   trend = " The sky is clearing."
+            elif fp["trend"] == "degrading": trend = " Transparency is fading."
+
         if score < 0.8:
-            return "The sky is veiled in clouds; the stars are resting."
+            return "The sky is veiled. We wait patiently for the curtain to lift."
+        if ctx and ep >= 90:
+            return f"An exceptional night — top {100-ep}% of all {ctx['nights_total']} nights observed.{trend}"
         if moon_up and score > 1.2:
-            return "The Moon dominates the heights, but the air is crystal clear."
+            return f"The Moon commands the sky, yet the air is crystal clear.{trend}"
         if stars > 40:
-            return "A magnificent night; the deep sky is fully revealed."
+            return f"A magnificent night. The deep sky is fully revealed.{trend}"
+        if ctx and ep >= 60:
+            return f"A good night — above average across {ctx['nights_total']} sessions.{trend}"
         if score >= 1.0:
-            return "The atmosphere is steady. We are watching."
-        return "The sky is quiet."
+            return f"The atmosphere is steady. We are watching.{trend}"
+        return f"The sky is quiet. Holding vigil.{trend}"
     # -----------------
     # 6. OUTPUTS: EVENTS & TIMELAPSE
     # -----------------
@@ -7118,7 +7171,12 @@ class Pipeline:
                     "effective_threshold": self.last_effective_threshold,
                     "start": self.cfg.get("general", {}).get("start_time"),
                     "end": self.cfg.get("general", {}).get("end_time"),
-                    "shutdown": self.cfg.get("general", {}).get("shutdown_time")
+                    "shutdown": self.cfg.get("general", {}).get("shutdown_time"),
+                    "loc_name": self.cfg["general"].get("location") or "Unknown",
+                    "lat": self.cfg["general"].get("latitude", 0.0),
+                    "lon": self.cfg["general"].get("longitude", 0.0),
+                    "cam_az": self.cfg["general"].get("camera_azimuth", 0.0),
+                    "cam_alt": self.cfg["general"].get("camera_altitude", 90.0)
                 }
                 
             if status['is_stable']:
@@ -7149,7 +7207,7 @@ class Pipeline:
                 illuminance_class = "warn" # Not a valid number, show yellow
 
             # 3. Determine the CSS class for star count
-            normal_class = "normal"
+            normal_class = "highlight"
             bold = "bold"
             stars_class = "ok" # Default to green
             try:
@@ -7394,7 +7452,44 @@ class Pipeline:
             # Efficiency: How many events vs how much noise
             # A high ratio means the detector is perfectly tuned.
             noise_ratio = stats["rejected_contours"] / (stats["total_events"] or 1)
-            
+
+            ctx = self._get_chronicle_context()
+            fp = self._generate_atmosphere_fingerprint(stats.get("sky_history", []))
+
+            if ctx:
+                chronicle_row = (
+                    f"Night #{ctx['nights_total']} &nbsp;·&nbsp; "
+                    f"Events: {ctx['events_pct']}th pct &nbsp;·&nbsp; "
+                    f"Sky: {ctx['score_pct']}th pct"
+                )
+                chronicle_class = "ok" if ctx['events_pct'] >= 60 else "warn"
+            else:
+                chronicle_row  = "First night on record."
+                chronicle_class = "warn"
+                
+            # Sparkline SVG (generate inline):
+            sparkline_html = ""
+            sl = fp.get("sparkline", [])
+            if len(sl) >= 2:
+                W, H = 180, 36
+                mn, mx_val = min(sl), max(sl)
+                rng = mx_val - mn if mx_val > mn else 1.0
+                pts = []
+                for i, v in enumerate(sl):
+                    x = int(i / (len(sl) - 1) * (W - 6)) + 3
+                    y = int((1 - (v - mn) / rng) * (H - 6)) + 3
+                    pts.append(f"{x},{y}")
+                color = {"improving": "#4ecca3", "degrading": "#e06c75", "stable": "#c678dd"}.get(fp["trend"], "#888")
+                sparkline_html = (
+                    f'<svg width="{W}" height="{H}" style="display:block;margin:6px auto 2px;" '
+                    f'title="Sky quality over time: {fp["trend"]}">'
+                    f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" stroke-width="2.5" '
+                    f'stroke-linejoin="round" stroke-linecap="round"/>'
+                    f'</svg>'
+                    f'<p style="font-size:0.75em;color:{color};text-align:center;margin:0 0 6px;">'
+                    f'Sky trend: {fp["trend"]} ({fp.get("slope", 0.0):+.2f} / hr)</p>'
+                )
+
             morning_report_html = f"""
             <div class="card" style="border: 1px solid #c678dd; background: linear-gradient(145deg, #2b2b2b, #352b3b);">
                 <h2 style="color: #c678dd;">🌙 Session Mission Report</h2>
@@ -7404,7 +7499,9 @@ class Pipeline:
                     <tr><td>Weather Stability</td><td>{100-cloud_percent:.0f}% Clear Sky</td></tr>
                     <tr><td>Moon Influence</td><td>In View for {stats['moon_visible_minutes']} min (Max Impact: {int(stats['max_moon_impact']*100)}%)</td></tr>
                     <tr><td>Session Duration</td><td>{dur_total_min // 60}h {dur_total_min % 60}m</td></tr>
+                    <tr><td>Chronicle Row</td><td>{chronicle_row}</td></tr>
                 </table>
+                {sparkline_html}
                 <p style="font-size: 0.8em; color: #888; margin-top: 10px; text-align: center;">
                     "The stars are the streetlights of eternity." - Meteora Intelligence
                 </p>
@@ -7497,17 +7594,35 @@ class Pipeline:
                  status_html = '<td class="ok">Running</td>' if name in status["live_threads"] else '<td class="err">Stopped</td>'
                  threads_html_rows += f"<tr><td>{name}</td>{status_html}</tr>"
             
-            # Component: System Vitals Table
             system_vitals_rows = f"""
                 <tr><td>System Date</td><td>{system_date}</td></tr>
                 <tr><td>System Time (Local)</td><td>{system_time}</td></tr>            
+                <tr><td>Location</td><td class="highlight">{status["loc_name"]}</td></tr>
+                <tr>
+                  <td>Coordinates</td>
+                  <td>
+                    <span class="normal">Lat:</span>
+                    <span class="highlight">{status["lat"]:.4f}</span>,
+                    <span class="normal">Lon:</span>
+                    <span class="highlight">{status["lon"]:.4f}</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td>Camera Pointing</td>
+                  <td>
+                    <span class="normal">Azimuth:</span>
+                    <span class="highlight">{status["cam_az"]:.2f}</span>,
+                    <span class="normal">Altitude:</span>
+                    <span class="highlight">{status["cam_alt"]:.2f}</span>
+                  </td>
+                </tr>
                 <tr><td>CPU Temperature</td><td class="{'warn' if cpu_temp_raw > 75 else 'ok'}">{cpu_temp}</td></tr>
                 <tr><td>Memory Usage</td><td class="{'warn' if mem.percent > 80 else 'ok'}">{mem_used} ({mem.percent}%)</td></tr>
                 <tr><td>Disk Usage ({monitor_path})</td><td class="{'err' if disk.percent > 90 else 'warn' if disk.percent > threshold else 'ok'}">{disk_used} ({disk.percent}%)</td></tr>
                 <tr><td>Load Average (1m)</td><td>{load1:.2f}</td></tr>
                 <tr><td>Uptime</td><td>{uptime_str}</td></tr>
-            """            
-           
+            """
+
             picture_box_html = ""
             # is_timelapse_enabled = self.cfg["timelapse"].get("stack_N", 0) > 0
             
@@ -7600,7 +7715,8 @@ class Pipeline:
                 .ok {{ color: #98c379; font-weight: bold; }}
                 .warn {{ color: #e5c07b; font-weight: bold; }}
                 .err {{ color: #e06c75; font-weight: bold; }}
-                .normal {{ color: #61AFEF; font-weight: bold; }} 
+                .normal {{ color: #E0E0E0; }} 
+                .highlight {{ color: #61AFEF; font-weight: bold; }} 
                 .bold {{ font-weight: bold; }} 
                 button {{ background: #61afef; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; font-size: 0.9em; margin: 5px 0; transition: 0.2s; }}
                 button:hover {{ background: #4fa3d8; }}
@@ -8395,7 +8511,7 @@ if __name__ == '__main__':
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)  # ← Non-zero exit code
 
-    if not os.path.exists(args.config):
+    if args.config and not os.path.exists(args.config):
         print(f"ERROR: Configuration file not found at '{args.config}'.", file=sys.stderr)
         print("Please create one or run with --create-config to generate a default file.", file=sys.stderr)
         sys.exit(1)
