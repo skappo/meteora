@@ -320,7 +320,7 @@ class DetectionConfig(BaseModel):
     static_threshold: conint(ge=0, le=255) = DEFAULTS["detection"]["static_threshold"]  
     min_threshold: conint(ge=0, le=255) = DEFAULTS["detection"]["min_threshold"]
     max_threshold: conint(ge=0, le=255) = DEFAULTS["detection"]["max_threshold"]   
-    @field_validator('dark_frame_path', mode='before')
+    @field_validator('dark_frame_path', 'bias_frame_path', 'flat_frame_path', mode='before')
     def allow_empty_str_for_optional_path(cls, v):
         # If the input is an empty string, convert it to None before other validation.
         if v == '':
@@ -423,6 +423,11 @@ class HeartbeatConfig(BaseModel):
     enabled: bool = DEFAULTS["heartbeat"]["enabled"]
     url: Optional[str] = DEFAULTS["heartbeat"]["url"]
     interval_min: conint(gt=10,le=60) = DEFAULTS["heartbeat"]["interval_min"]
+    @field_validator('url', mode='before')
+    def allow_empty_str_for_url(cls, v):
+        if v == '':
+            return None
+        return v
 
 class EventLogConfig(BaseModel):
     enabled: bool = DEFAULTS["event_log"]["enabled"]
@@ -6035,12 +6040,13 @@ class Pipeline:
 
         while self.running.is_set():
             hb_cfg = self.cfg.get("heartbeat", {})
+            enabled = hb_cfg.get("enabled", False)
             url = hb_cfg.get("url")
             active_interval_min = hb_cfg.get("interval_min", 60)
             # Use a different, potentially longer interval for when the system is idle
             idle_interval_min = self.cfg["general"].get("idle_heartbeat_interval_min", 120) # e.g., 2 hours
 
-            if not url:
+            if not enabled or not url:
                 # If disabled or URL missing during a reload, wait and check again.
                 time.sleep(60)
                 continue
@@ -6435,9 +6441,14 @@ class Pipeline:
                     for param in params:
                         form_key = f"{section}_{param}"
                         if form_key in request.form:
+                            val = request.form[form_key]
+                            # Skip blank fields to avoid validation errors and let defaults take over
+                            if val == '':
+                                continue
+
                             if section not in changes_from_form:
                                 changes_from_form[section] = {}
-                            changes_from_form[section][param] = request.form[form_key]
+                            changes_from_form[section][param] = val
 
                 try:
                     validated_changes = MainConfig.model_validate(changes_from_form).model_dump(exclude_unset=True)
@@ -6650,9 +6661,15 @@ class Pipeline:
                     d = form_dict
                     for part in parts[:-1]:
                         d = d.setdefault(part, {})
-                    # For checkboxes, request.form.getlist(key) will be ['false', 'true'].
-                    # We take the last one, which is the correct state.
-                    d[parts[-1]] = request.form.getlist(key)[-1]
+
+                    val = request.form.getlist(key)[-1]
+                    # If a field is cleared (blank string), we omit it from the input dict.
+                    # This allows Pydantic to use the default value defined in the schema,
+                    # preventing validation errors for numeric or pattern-matched fields.
+                    if val == '':
+                        continue
+
+                    d[parts[-1]] = val
 
                 # 2. Validate the data from the form. Pydantic will handle type coercion.
                 try:
@@ -6660,7 +6677,9 @@ class Pipeline:
                     final_cfg = validated_model.model_dump()
                 except Exception as e:
                     logging.error(f"New configuration failed validation: {e}")
-                    return f"Configuration validation failed. Check logs. <a href='/settings?token={DASH_TOKEN}'>Go back</a>"
+                    # Escape HTML in the error message for safety
+                    safe_error = html.escape(str(e))
+                    return f"Configuration validation failed:<br><pre>{safe_error}</pre><br><a href='/settings?token={DASH_TOKEN}'>Go back</a>"
 
                 # 3. Load the user's original config file to use as a structural template.
                 config_to_save = self.legacy_load_config(self.config_path, merge=False)
