@@ -186,12 +186,7 @@ DEFAULTS = {
         "csv_rotation_mb": 20,
         "csv_backup_count": 5,
         "threshold": 90.0,
-        "target": 75.0,
-        "priority_delete": [
-            "daylight",   # First, delete old sky condition snapshots
-            "timelapse",  # Next, delete old timelapses
-            "events"      # Last resort, delete old events      
-        ]                      
+        "target": 75.0                    
     },
     "dashboard": {
         "enabled": True,
@@ -225,7 +220,7 @@ DEFAULTS = {
         "max_offset_sec": 2.0
     },
     "general": {
-        "version": "197.47",
+        "version": "197.51",
         "debug_level": 0,
         "debug_visualization": False,
         "record_raw_frames": False,
@@ -320,7 +315,8 @@ class DetectionConfig(BaseModel):
     static_threshold: conint(ge=0, le=255) = DEFAULTS["detection"]["static_threshold"]  
     min_threshold: conint(ge=0, le=255) = DEFAULTS["detection"]["min_threshold"]
     max_threshold: conint(ge=0, le=255) = DEFAULTS["detection"]["max_threshold"]   
-    @field_validator('dark_frame_path', mode='before')
+    @field_validator('dark_frame_path', 'bias_frame_path', 'flat_frame_path', mode='before')
+    @classmethod
     def allow_empty_str_for_optional_path(cls, v):
         # If the input is an empty string, convert it to None before other validation.
         if v == '':
@@ -392,7 +388,6 @@ class JanitorConfig(BaseModel):
     csv_backup_count: conint(gt=0,le=10) = DEFAULTS["janitor"]["csv_backup_count"]
     threshold: float = DEFAULTS["janitor"]["threshold"]
     target: float = DEFAULTS["janitor"]["target"]
-    priority_delete: List[str] = DEFAULTS["janitor"]["priority_delete"]
 
     @field_validator('monitor_path')
     def validate_monitor_path(cls, v):
@@ -423,6 +418,13 @@ class HeartbeatConfig(BaseModel):
     enabled: bool = DEFAULTS["heartbeat"]["enabled"]
     url: Optional[str] = DEFAULTS["heartbeat"]["url"]
     interval_min: conint(gt=10,le=60) = DEFAULTS["heartbeat"]["interval_min"]
+
+    @field_validator('url', mode='before')
+    @classmethod
+    def allow_empty_str_for_url(cls, v):
+        if v == '':
+            return None
+        return v
 
 class EventLogConfig(BaseModel):
     enabled: bool = DEFAULTS["event_log"]["enabled"]
@@ -466,11 +468,12 @@ class GeneralConfig(BaseModel):
     lens_vfov : conint(ge=0,le=360) = DEFAULTS["general"]["lens_vfov"]  
     maintenance_timeout: conint(gt=0) = DEFAULTS["general"]["maintenance_timeout"]
     shutdown_time: Optional[constr(pattern=r'^\d{2}:\d{2}$')] = DEFAULTS["general"]["shutdown_time"]
-    start_time: constr(pattern=r'^\d{2}:\d{2}$') = DEFAULTS["general"]["start_time"]
-    end_time: constr(pattern=r'^\d{2}:\d{2}$') = DEFAULTS["general"]["end_time"]
-    @field_validator('location', 'shutdown_time', mode='before')
+    start_time: Optional[constr(pattern=r'^\d{2}:\d{2}$')] = DEFAULTS["general"]["start_time"]
+    end_time: Optional[constr(pattern=r'^\d{2}:\d{2}$')] = DEFAULTS["general"]["end_time"]
+    @field_validator('location', 'shutdown_time', 'start_time', 'end_time', mode='before')
+    @classmethod
     def allow_empty_str_for_optionals(cls, v):
-        # This single validator handles both 'location' and 'shutdown_time'
+        # This single validator handles location and time fields
         if v == '':
             return None
         return v
@@ -3300,6 +3303,7 @@ class Pipeline:
         recent_frames = deque(maxlen=buffer_frames)
         
         # --- State Management for creating two different packages ---
+
         current_event_video_frames = []
         current_event_stack_frames = []
         event_cooldown_counter = 0
@@ -3450,16 +3454,18 @@ class Pipeline:
                 area = cv2.contourArea(c) 
                 if area < self.min_area:
                     rejection_stats["area"] += 1
+#                    with self.status_lock:
+#                        self.session_stats["rejected_contours"] += 1
                 else:
                     accepted_cnts += 1
             
             detected = (accepted_cnts > 0)
-
+            
             # --- Update Global Session Stats ---
             with self.status_lock:
                 self.session_stats["rejected_contours"] += rejection_stats["area"]
                 self.session_stats["total_events"] += raw_contour_count
-             
+                
             if debug_level >= 1:
                 mean_val, std_dev = cv2.meanStdDev(diff)
                 noise_sigma = float(std_dev[0][0]) / 256.0
@@ -3519,6 +3525,8 @@ class Pipeline:
                     current_event_stack_frames = [(ts, frame.copy(), effective_threshold)]
                     current_event_frame_count = len(current_event_video_frames)
                     with self.status_lock:
+                        # Track noise: all rejected contours from this event
+#                        self.session_stats["rejected_contours"] += rejection_stats["total"]
                         self.session_stats["accepted_events"] += 1
                 else:
                     # --- EVENT CONTINUES ---
@@ -3528,6 +3536,8 @@ class Pipeline:
                     current_event_frame_count += 1
                 
                 event_cooldown_counter = 0 # Reset cooldown on new detection
+#                with self.status_lock:
+#                    self.session_stats["total_events"] += raw_contour_count
             
             elif self.event_in_progress.is_set():
                 # --- EVENT COOLDOWN ---
@@ -5628,6 +5638,8 @@ class Pipeline:
         Tier 1: Deletes leftover temporary event frame directories.
         Tier 2: Deletes the oldest timelapse files.
         """
+        # architettural choice no need to change via config
+        delete_priority = ["daylight", "timelapse", "events"]
         try:
             # 1. Get the path to monitor from the configuration.
             monitor_path = self.cfg["janitor"].get("monitor_path", "/")
@@ -5673,7 +5685,7 @@ class Pipeline:
             }
             
             # Get the deletion order from the config
-            delete_priority = self.cfg["janitor"].get("priority_delete", ["daylight", "timelapse", "events"])
+            #delete_priority = self.cfg["janitor"].get("priority_delete", ["daylight", "timelapse", "events"])
 
             for tier_name in delete_priority:
                 # Check disk space before starting each tier
@@ -6025,8 +6037,17 @@ class Pipeline:
         Crucially, this thread runs INDEPENDENTLY of the main capture schedule
         to signal that the script process is alive at all times.
         """
-        logging.info("Heartbeat monitor started.")
+#        hb_cfg = self.cfg.get("heartbeat", {})
 
+#        url = hb_cfg.get("url")
+#        active_interval_min = hb_cfg.get("interval_min", 60)
+#        # Use a different, potentially longer interval for when the system is idle
+#        idle_interval_min = self.cfg["general"].get("idle_heartbeat_interval_min", 120) # e.g., 2 hours
+        logging.info("Heartbeat monitor started.")
+        
+#        if not url:
+#            logging.warning("Heartbeat is enabled, but no valid URL is configured.")
+#            return
         while self.running.is_set():
             hb_cfg = self.cfg.get("heartbeat", {})
             url = hb_cfg.get("url")
@@ -6038,13 +6059,20 @@ class Pipeline:
                 # If disabled or URL missing during a reload, wait and check again.
                 time.sleep(60)
                 continue
-        
+#        try:
+#            import requests
+#        except ImportError:
+#            logging.error("'requests' library is required for the heartbeat feature. Please run 'pip3 install requests'.")
+#            return
+
+#        logging.info(f"Heartbeat monitor started. Will ping every {active_interval_min} min (active) or {idle_interval_min} min (idle).")
             try:
                 import requests
             except ImportError:
                 logging.error("'requests' library is required for the heartbeat feature. Please run 'pip3 install requests'.")
                 return
-
+                
+#        while self.running.is_set():
             # 1. Determine the current state and wait interval
             is_active = self.producer_thread_active()
             current_interval_sec = (active_interval_min if is_active else idle_interval_min) * 60
@@ -6078,6 +6106,13 @@ class Pipeline:
         Periodically checks the system clock against an NTP server. If significant
         drift is detected, it triggers the OS's own time service to re-synchronize.
         """
+        # ntp_cfg = self.cfg.get("ntp", {})
+
+        # server = ntp_cfg.get("server", "pool.ntp.org")
+        # interval_sec = ntp_cfg.get("sync_interval_hours", 6) * 3600
+        # max_offset = ntp_cfg.get("max_offset_sec", 2.0)
+        
+        # logging.info(f"NTP clock monitor started. Will check against '{server}' every {interval_sec / 3600} hours.")
         logging.info("NTP clock monitor started.")
         time.sleep(60) # Initial delay for network
 
@@ -6086,6 +6121,8 @@ class Pipeline:
                 ntp_cfg = self.cfg.get("ntp", {})
                 server = ntp_cfg.get("server", "pool.ntp.org")
                 interval_sec = ntp_cfg.get("sync_interval_hours", 6) * 3600
+                max_offset = ntp_cfg.get("max_offset_sec", 2.0)
+                logging.info("Performing periodic NTP clock check...")
                 max_offset = ntp_cfg.get("max_offset_sec", 2.0)
 
                 logging.info("Performing periodic NTP clock check against '%s'...", server)
@@ -6640,8 +6677,6 @@ class Pipeline:
         def save_settings():
             logging.warning("Received request to save full configuration from dashboard.")
             try:
-                # --- START: NEW, CORRECTED LOGIC ---
-
                 # 1. Build a dictionary from the multi-part form data.
                 # This correctly handles checkboxes by taking the last value ('true' if checked).
                 form_dict = {}
@@ -6650,8 +6685,6 @@ class Pipeline:
                     d = form_dict
                     for part in parts[:-1]:
                         d = d.setdefault(part, {})
-                    # For checkboxes, request.form.getlist(key) will be ['false', 'true'].
-                    # We take the last one, which is the correct state.
                     d[parts[-1]] = request.form.getlist(key)[-1]
 
                 # 2. Validate the data from the form. Pydantic will handle type coercion.
@@ -6662,26 +6695,11 @@ class Pipeline:
                     logging.error(f"New configuration failed validation: {e}")
                     return f"Configuration validation failed. Check logs. <a href='/settings?token={DASH_TOKEN}'>Go back</a>"
 
-                # 3. Load the user's original config file to use as a structural template.
-                config_to_save = self.legacy_load_config(self.config_path, merge=False)
-                if not isinstance(config_to_save, dict): config_to_save = {}
+                # 3. Save the perfectly validated configuration directly to disk.
+                # This completely bypasses the old, buggy dictionary merging logic.
+                self.save_json_atomic(self.config_path, final_cfg)
                 
-                # 4. Recursively update the template with new values from the validated form data.
-                #    This preserves the exact structure of the user's original config file.
-                def update_existing_keys(original_dict, new_full_dict):
-                    for key, value in original_dict.items():
-                        if key in new_full_dict:
-                            if isinstance(value, dict) and isinstance(new_full_dict.get(key), dict):
-                                # Recurse into nested dictionaries
-                                update_existing_keys(value, new_full_dict[key])
-                            else:
-                                # Update the value in the original dictionary
-                                original_dict[key] = new_full_dict[key]
-
-                update_existing_keys(config_to_save, final_cfg)
-                
-                # 5. Save the updated configuration and trigger a reload.
-                self.save_json_atomic(self.config_path, config_to_save)
+                # 4. Trigger the smart reloader.
                 self.reload_config_signal.set()
                 self.config_reloaded_ack.wait(timeout=3.0)
                 self.config_reloaded_ack.clear()
@@ -7164,7 +7182,7 @@ class Pipeline:
             with self.maintenance_timeout_lock:
                 status["maintenance_timeout_until"] = self.maintenance_timeout_until
 
-            system_status_str = "Active Schedule" if status["is_in_schedule"] else "Idle Schedule"
+            system_status_str = "Active" if status["is_in_schedule"] else "Idle"
             system_status_class = "ok" if status["is_in_schedule"] else "warn"
 
             # 2. Determine the CSS class for illuminance
@@ -7521,7 +7539,7 @@ class Pipeline:
             # --- GENERATE ALL HTML COMPONENTS ---
             pipeline_status_rows = f"""
                 {debug_level_row}
-                <tr><td>System Status</td><td class="{system_status_class}">{system_status_str}</td></tr>
+                <tr><td>Schedule</td><td span class="{system_status_class}">{system_status_str}</span> <span class="normal">{status["start"]} → {status["end"]}</span></td></tr>
                 <tr><td>Capture Active</td><td class="{'ok' if status['capture_active'] else 'warn'}">{status['capture_active']}</td></tr>
                 <tr><td>Pipeline State</td><td class="{pipeline_state_class}">{pipeline_state_str}</td></tr>
                 <tr><td>Pipeline Mode</td><td class="{pipeline_mode_class}">{pipeline_mode_str}</td></tr>
@@ -7551,8 +7569,6 @@ class Pipeline:
                 <tr><td>Exposure (us)</td><td>{status['current_exposure']}</td></tr>
                 <tr><td>Gain</td><td>{status['current_gain']:.2f}</td></tr>
                 {sftp_status_html}
-                <tr><td>Start Acquisition</td><td>{status["start"]}</td></tr>
-                <tr><td>End Acquisition</td><td>{status["end"]}</td></tr>
                 <tr><td>Shutdown System</td><td>{status["shutdown"]}</td></tr>
             """
                 # {queue_status_html}
@@ -8064,12 +8080,20 @@ class Pipeline:
             self.consecutive_camera_failures = 0    
     # -----------------   
     def within_schedule(self):
+        start_str = self.cfg["general"].get("start_time")
+        end_str = self.cfg["general"].get("end_time")
+        
+        # If either time is cleared/None, the system runs 24/7 without stopping
+        if not start_str or not end_str:
+            return True
+            
         now = datetime.now()
-        start_h, start_m = map(int, self.cfg["general"]["start_time"].split(":"))
-        end_h, end_m = map(int, self.cfg["general"]["end_time"].split(":"))
+        start_h, start_m = map(int, start_str.split(":"))
+        end_h, end_m = map(int, end_str.split(":"))
         start = dtime(start_h, start_m)
         end = dtime(end_h, end_m)
         current = now.time()
+        
         if start <= end:
             return start <= current <= end
         else:
