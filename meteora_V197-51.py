@@ -1728,6 +1728,7 @@ class Pipeline:
     def __init__(self, cfg, config_path=None, simulate=False):
 
         self.cfg = cfg
+        self.simulate_mode = simulate
         
         self.config_path = config_path or "config.json"  # config path
         self._apply_resolution_aware_tuning()
@@ -1776,7 +1777,7 @@ class Pipeline:
         self.is_calibrating.clear()
         self.event_counter = 0
 
-        if args.simulate:
+        if self.simulate_mode:
             # Use the fake camera
             self.camera = FrameSimulator(cfg["capture"])
         else:
@@ -2627,17 +2628,22 @@ class Pipeline:
         Optimized V188: Handles long-exposures by breaking hardware locks and using dynamic timeouts.
         """
         producer_names_to_stop = ["CaptureThread", "DetectionThread"]
-        threads_to_stop = [t for t in self.worker_threads if t.name in producer_names_to_stop and t.is_alive()]
 
-        if not threads_to_stop:
-            logging.warning("stop_producer_thread was called, but no producer threads were found running.")
+        # Identify all producer threads, whether alive or dead, to ensure they are cleaned up
+        threads_to_cleanup = [t for t in self.worker_threads if t.name in producer_names_to_stop]
+
+        # Filter for those we actually need to signal and wait for
+        threads_to_stop = [t for t in threads_to_cleanup if t.is_alive()]
+
+        if not threads_to_cleanup:
+            logging.warning("stop_producer_thread was called, but no producer threads were found in the worker list.")
             return
 
         # 1. Pause Watchdog
         try:
             logging.warning("Pausing watchdog for producer thread shutdown procedure.")
             self.watchdog_pause.set()
-            self.update_worker_list(threads_to_stop)
+            self.update_worker_list(threads_to_cleanup)
         finally:
             logging.info("Resuming watchdog. Producer threads will now be joined.")
             self.watchdog_pause.clear()
@@ -2694,16 +2700,16 @@ class Pipeline:
 
         logging.info("Data production chain has been cleanly stopped.")
     # -----------------
-    def update_worker_list(self, threads_to_stop):
+    def update_worker_list(self, threads_to_cleanup):
 
-        if not threads_to_stop:
-            logging.warning("stop_producer_thread called but no producer threads were found running.")
+        if not threads_to_cleanup:
+            logging.warning("stop_producer_thread called but no producer threads were found in the worker list.")
             return
 
         # 2. Immediately remove these threads from the main worker list.
         #    This is the key step that prevents the watchdog race condition.
-        self.worker_threads = [t for t in self.worker_threads if t not in threads_to_stop]
-        logging.info(f"Removed {[t.name for t in threads_to_stop]} from watchdog monitoring list.")
+        self.worker_threads = [t for t in self.worker_threads if t not in threads_to_cleanup]
+        logging.info(f"Removed {[t.name for t in threads_to_cleanup]} from watchdog monitoring list.")
     # -----------------
     def producer_thread_active(self):
         """Checks if the single CaptureThread is alive."""
@@ -3084,7 +3090,7 @@ class Pipeline:
                 # 3. Process the collected frames if everything went well.
                 if capture_ok:
                     logging.info("Stacking %d frames for calibration image...", len(frames_for_stack))
-                    stacked_image, _ = self.stack_frames(
+                    stacked_image, _, _ = self.stack_frames(
                         [f for _, f in frames_for_stack],
                         align=self.cfg["timelapse"]["stack_align"],
                         method="mean",
@@ -6175,7 +6181,7 @@ class Pipeline:
         """
         logging.info("Smart configuration reloader thread started.")
 
-        CRITICAL_CAPTURE_PARAMS = ["width", "height", "exposure_us", "gain", "auto_exposure", "red_gain", "blue_gain"]
+        CRITICAL_CAPTURE_PARAMS = ["width", "height", "exposure_us", "gain", "auto_exposure_tuning", "red_gain", "blue_gain"]
         CRITICAL_POWER_PARAMS = ["pin"] # Pin for the power monitor
 
         last_cfg = json.loads(json.dumps(self.cfg)) 
@@ -6234,7 +6240,10 @@ class Pipeline:
 
                                 try:
                                     self.camera.release()
-                                    self.camera = CameraCapture(self.cfg["capture"])
+                                    if self.simulate_mode:
+                                        self.camera = FrameSimulator(self.cfg["capture"])
+                                    else:
+                                        self.camera = CameraCapture(self.cfg["capture"])
                                     logging.info("Camera re-initialized successfully with new settings.")
                                 except Exception:
                                     logging.critical("Failed to re-initialize camera! This is a fatal error.", exc_info=True)
