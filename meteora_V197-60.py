@@ -71,7 +71,12 @@ import csv
 import html
 import requests   
 import gpiod
-import random          
+import random    
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 from zipfile import ZipFile
 from enum import Enum, auto
 from collections import deque
@@ -112,8 +117,6 @@ DEFAULTS = {
         "target_sky_brightness": 15,  # Target median brightness on a 0-255 scale
         "min_exposure_us": 100000,    # 0.1 seconds
         "max_exposure_us": 800000,    # 0.8 seconds (CRUCIAL meteor constraint)
-        "snap_exposure_us": 8000000,  # 8 sec
-        "snap_gain": 4,
         "min_gain": 1.0,
         "max_gain": 12.0,             # The practical maximum before excessive noise  
         "tolerance": 2,
@@ -124,7 +127,6 @@ DEFAULTS = {
         "min_area": 50,
         "pre_event_frames": 8,
         "event_cooldown_frames": 16,
-        "max_event_frames": 300,
         "dark_frame_path": None,
         "bias_frame_path": None,
         "flat_frame_path": None,
@@ -145,6 +147,7 @@ DEFAULTS = {
         "daymode_interval_sec": 60,
         "stack_method": "mean",
         "min_features_for_alignment": 3,
+        "roi_percent": 0.7,
         "auto_stack_method": False,
         "auto_stack_brightness_threshold": 40,
         "auto_sum_darkness_threshold": 15,
@@ -220,12 +223,11 @@ DEFAULTS = {
         "max_offset_sec": 2.0
     },
     "general": {
-        "version": "197.51",
+        "version": "197.60",
         "debug_level": 0,
         "debug_visualization": False,
         "record_raw_frames": False,
         "log_dir": "logs",
-        "max_queue_size": 1000,
         "hostname": socket.gethostname(),
         "location": None,
         "latitude": 0.0,
@@ -244,14 +246,32 @@ DEFAULTS = {
         "end_time": "06:00"
     }
 }
+# List of location used as reminder (for now)
+LOCATION = {
+    1: { "location": "Perugia", "latitude": 43.155849, "longitude": 12.404035, "camera_azimuth": 30, "camera_altitude": 90.0 },
+    2: { "location": "Roma", "latitude": 41.780143, "longitude": 12.526866, "camera_azimuth": 280, "camera_altitude": 90.0 }
+}
 # Values tuned for optimal balance of sensitivity and RAM safety
 RESOLUTION_TUNING_PROFILES = {
     # format: TotalPixels (MP) : {settings}
-    0.5: { "min_area": 30,  "min_changes": 10,  "max_q": 1000, "radius": 4,  "std_floor": 2.5 }, # VGA
-    1.0: { "min_area": 60,  "min_changes": 22,  "max_q": 1000, "radius": 5,  "std_floor": 2.0 }, # 720p
-    2.0: { "min_area": 180, "min_changes": 50,  "max_q": 350,  "radius": 10, "std_floor": 1.0 }, # 1080p
-    3.0: { "min_area": 300, "min_changes": 80,  "max_q": 250,  "radius": 12, "std_floor": 0.8 }, # 2K
-    12.3:{"min_area": 700, "min_changes": 300, "max_q": 60,   "radius": 20, "std_floor": 0.5 }  # 4K / HQ
+    0.5: { "description": "VGA", "min_area": 30,  "min_changes": 10,  "max_q": 1000, "max_event_frames": 50, "max_event_q": 10, "radius": 4,  "std_floor": 2.3 }, # VGA  2.5
+    1.0: { "description": "720", "min_area": 60,  "min_changes": 22,  "max_q": 1000, "max_event_frames": 50, "max_event_q": 5, "radius": 5,  "std_floor": 1.8 }, # 720p 2.0
+    2.0: { "description": "1080", "min_area": 180, "min_changes": 50,  "max_q": 350,  "max_event_frames": 50, "max_event_q": 3, "radius": 10, "std_floor": 0.9 }, # 1080p  1.0
+    3.0: { "description": "2K", "min_area": 300, "min_changes": 80,  "max_q": 250,  "max_event_frames": 50, "max_event_q": 2, "radius": 12, "std_floor": 0.6 }, # 2K  0.8
+    12.3:{ "description": "4K", "min_area": 700, "min_changes": 300, "max_q": 60,   "max_event_frames": 20, "max_event_q": 1, "radius": 20, "std_floor": 0.3 }  # 4K / HQ   0.5
+}
+# Values tuned for sky_score logic
+# | Score     | Stato              |
+# | --------- | ------------------ |
+# | ≥ 1.3     | Excellent          |
+# | 1.0 – 1.3 | Good               |
+# | 0.8 – 1.0 | Fair               |
+# | < 0.8     | Cloudy             |
+SKY_SCORE_VALUES = {
+    "cloudy": 0.1,
+    "fair": 0.8,
+    "good": 1.0,
+    "excellent": 1.3
 }
 # --------------------------- Configuration Schema (Pydantic) ---------------------------
 class CaptureConfig(BaseModel):
@@ -265,8 +285,6 @@ class CaptureConfig(BaseModel):
     target_sky_brightness: conint(ge=0, le=255) = DEFAULTS["capture"]["target_sky_brightness"]
     min_exposure_us: conint(gt=0) = DEFAULTS["capture"]["min_exposure_us"]
     max_exposure_us: conint(gt=0) = DEFAULTS["capture"]["max_exposure_us"]
-    snap_exposure_us: conint(gt=0) = DEFAULTS["capture"]["snap_exposure_us"]
-    snap_gain: confloat(gt=0,le=16) = DEFAULTS["capture"]["snap_gain"]
     min_gain: confloat(ge=1.0) = DEFAULTS["capture"]["min_gain"]
     max_gain: confloat(ge=1.0, le=16.0) = DEFAULTS["capture"]["max_gain"]      
     tolerance: conint(gt=0,le=10) = DEFAULTS["capture"]["tolerance"]
@@ -304,7 +322,6 @@ class DetectionConfig(BaseModel):
     min_area: conint(gt=0,le=1000) = DEFAULTS["detection"]["min_area"]
     pre_event_frames: conint(ge=0, le=100) = DEFAULTS["detection"]["pre_event_frames"]
     event_cooldown_frames: conint(ge=0) = DEFAULTS["detection"]["event_cooldown_frames"]
-    max_event_frames: conint(ge=0) = DEFAULTS["detection"]["max_event_frames"]
     dark_frame_path: Optional[str] = DEFAULTS["detection"]["dark_frame_path"]
     bias_frame_path: Optional[str] = DEFAULTS["detection"]["bias_frame_path"] 
     flat_frame_path: Optional[str] = DEFAULTS["detection"]["flat_frame_path"]
@@ -332,6 +349,7 @@ class TimelapseConfig(BaseModel):
     daymode_interval_sec: int = DEFAULTS["timelapse"]["daymode_interval_sec"]
     stack_method: str = DEFAULTS["timelapse"]["stack_method"]
     min_features_for_alignment: conint(ge=1, le=10) = DEFAULTS["timelapse"]["min_features_for_alignment"]
+    roi_percent: confloat(ge=0.4, le=0.8) = DEFAULTS["timelapse"]["roi_percent"]
     auto_stack_method: bool = DEFAULTS["timelapse"]["auto_stack_method"]
     auto_stack_brightness_threshold: conint(ge=0, le=255) = DEFAULTS["timelapse"]["auto_stack_brightness_threshold"]
     auto_sum_darkness_threshold: conint(ge=0, le=255) = DEFAULTS["timelapse"]["auto_sum_darkness_threshold"]
@@ -339,7 +357,6 @@ class TimelapseConfig(BaseModel):
     @field_validator('*', mode='after')
     def validate_thresholds(cls, v, values):
         # This validator runs after all individual fields are populated.
-        # We only need to run our logic once, so we check for the presence of both keys.
         if 'auto_sum_darkness_threshold' in values.data and 'auto_stack_brightness_threshold' in values.data:
             dark_thresh = values.data['auto_sum_darkness_threshold']
             bright_thresh = values.data['auto_stack_brightness_threshold']
@@ -453,7 +470,6 @@ class GeneralConfig(BaseModel):
     debug_level: int = Field(default=0, ge=0, le=4, description="0=Off, 1=Stats, 2=Images, 3=Full/Stream, 4=Variables dump")
     record_raw_frames: bool = Field(default=False, description="Save raw frames for replay")
     log_dir: str = DEFAULTS["general"]["log_dir"]
-    max_queue_size: conint(gt=0,le=1000) = DEFAULTS["general"]["max_queue_size"]
     hostname: str = DEFAULTS["general"]["hostname"]
     location: Optional[str] = DEFAULTS["general"]["location"]
     latitude: float = DEFAULTS["general"]["latitude"]
@@ -512,10 +528,10 @@ class MainConfig(BaseModel):
             
             # 2. Get available system memory
             try:
-                # Use a fresh check to get current available memory
+                # Check the current available memory
                 available_mem_bytes = psutil.virtual_memory().available
             except Exception:
-                # If psutil fails, fallback to a safe, low default (e.g., 2GB)
+                # If psutil fails, fallback to a safe, low default 2GB
                 available_mem_bytes = 2 * 1024 * 1024 * 1024
             
             # 3. Calculate a safe maximum stack size
@@ -545,8 +561,7 @@ class MainConfig(BaseModel):
     # --------------------------- Logging ---------------------------
 class ThreadColorLogFormatter(logging.Formatter):
     """
-    A custom logging formatter that assigns a unique color to each thread,
-    in addition to coloring the log level.
+    A custom logging formatter that assigns a unique color to each thread
     """
     RESET = "\033[0m"
     
@@ -649,18 +664,17 @@ class CameraCapture:
             
     def flush(self, target_exposure_us=None, target_gain=None, timeout_sec=None):
         """
-        Dynamically flushes the exact number of stale frames from the hardware pipeline
-        by inspecting the metadata of each frame until it matches the new settings.
+        Dynamically flushes the pipeline and RETURNS the first synchronized frame!
         """
         if target_exposure_us is None:
             # Fallback to simple flush if no targets are provided
             for _ in range(4):
-                try: self.picam2.capture_array()
+                try: 
+                    req = self.picam2.capture_request()
+                    req.release()
                 except Exception: pass
-            return
+            return None
 
-        # Calculate a safe timeout: 
-        # The time it takes for the NEW exposure to integrate + 30s buffer for the OLD queue
         if timeout_sec is None:
             timeout_sec = (target_exposure_us / 1000000.0) * 2.0 + 45.0
 
@@ -669,26 +683,28 @@ class CameraCapture:
         
         while time.time() - start_time < timeout_sec:
             try:
-                # capture_request is much faster/lighter than capture_array
                 req = self.picam2.capture_request()
+                img_array = req.make_array("main")
                 meta = req.get_metadata()
-                req.release()  # Critical: Free the memory buffer instantly
+                req.release()
 
                 actual_exp = meta.get("ExposureTime", 0)
                 actual_gain = meta.get("AnalogueGain", 0.0)
                 
-                # --- WIDE TOLERANCE ---
-                # Allow the hardware driver to round exposure by up to 5%
                 allowed_exp_variance = target_exposure_us * 0.05
 
-                # Check if this frame has our new settings
                 exp_match = abs(actual_exp - target_exposure_us) < allowed_exp_variance
                 gain_match = target_gain is None or abs(actual_gain - target_gain) < 0.5
 
                 if exp_match and gain_match:
                     if dropped > 0:
                         logging.debug(f"Camera: Pipeline synced perfectly. Flushed exactly {dropped} stale frame(s).")
-                    return # We reached the new frame! Stop flushing immediately.
+                    
+                    # --- Return the perfectly synced 16-bit frame! ---
+                    if img_array is not None:
+                        bgr_8bit = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                        return (bgr_8bit.astype(np.uint16) * 256)
+                    return None
 
                 dropped += 1
             except Exception as e:
@@ -696,6 +712,7 @@ class CameraCapture:
                 break
                 
         logging.warning(f"Camera: Flush timed out after {timeout_sec:.1f}s without confirming sync. Dropped {dropped} frames.")
+        return None
 
     def release(self):
         try:
@@ -709,17 +726,7 @@ class CameraCapture:
     # --------------------------- Sky Simulator ---------------------------    
 class FrameSimulator:
     """
-    Ultra-Realistic Sky + Sensor Simulator (v4.0 Corrected)
-
-    Optimisations:
-    - Vectorised star rotation (NumPy)
-    - Pre-allocated buffers
-    - Pre-generated noise bank (60 frames)
-    - Pre-computed star stamp masks (no per-star Python loop)
-
-    Logging:
-    - Day/Night transitions
-    - Meteor / Satellite / Airplane events
+    Ultra-Realistic Sky + Sensor Simulator (v11.0 Corrected)
     """
 
     def __init__(self, cfg: dict):
@@ -792,14 +799,17 @@ class FrameSimulator:
             "meteor_speed_max":       35.0,
             "meteor_thickness_min":   2,
             "meteor_thickness_max":   5,
+            
+            # Frame drops
+            "failure_rate": 0.1,  # 0.01 = 1% chance per frame to return None
         }
 
-
+        self.force_fatal_failure = False # Track if we want to simulate a dead sensor
 
         self.is_day_time = False
         self.ae_enabled  = False
 
-        # FIX #1 — define `parent` BEFORE the inner class so the closure is valid
+        # Define `parent` BEFORE the inner class so the closure is valid
         parent = self
 
         class DummyControls:
@@ -833,7 +843,7 @@ class FrameSimulator:
         self._init_clouds()
         self._init_streaks()
         self._init_meteors()
-        self._init_noise_bank()      # FIX #8 — 60-frame bank
+        self._init_noise_bank()      
         self._init_fpn_hotpixels()
 
         self.moon_phase_data = self._get_moon_phase_fraction()
@@ -866,7 +876,7 @@ class FrameSimulator:
         self.city_dome_map = (temp_dome * 30.0).astype(np.float32)[..., np.newaxis]
 
     def _init_noise_bank(self):
-        # FIX #8 — 60 frames eliminates visible cycling at normal frame rates
+        # 60 frames eliminates visible cycling at normal frame rates
         bank_size = 60
         self.noise_bank = np.random.normal(
             0, 1.0, (bank_size, self.height, self.width, 3)
@@ -888,7 +898,7 @@ class FrameSimulator:
             255 * (10 ** ((4.0 - mag) / 2.5)), 20, 255
         ).astype(np.float32)
 
-        # FIX #2 — Renamed masks to reflect true RGB appearance
+        # Renamed masks to reflect true RGB appearance
         #   White/neutral  : default (no mask)
         #   Warm yellow     : [1.0, 0.95, 0.7]   → reddish-yellow tint
         #   Cool red/orange : [1.0, 0.7, 0.5]    → orange-red
@@ -913,7 +923,7 @@ class FrameSimulator:
         radii = np.random.choice([1, 2, 3], n, p=[0.70, 0.25, 0.05])
         self.star_rads = radii
 
-        # FIX #6 — Pre-compute stamp masks; avoids per-star cv2.circle in render loop
+        # Pre-compute stamp masks; avoids per-star cv2.circle in render loop
         self.star_stamps: dict[int, np.ndarray] = {}
         for r_val in [2, 3]:
             stamp = cv2.getStructuringElement(
@@ -937,7 +947,7 @@ class FrameSimulator:
 
     def _generate_cloud_layer(self, layer: np.ndarray, params: dict):
         """
-        FIX #18 (v2) - True seamless tiling via 3x3 oversized canvas + center crop.
+        True seamless tiling via 3x3 oversized canvas + center crop.
 
         Strategy:
           1. Paint blobs on a 3x3 grid of tiles (9 copies of the same pattern).
@@ -1009,6 +1019,17 @@ class FrameSimulator:
             logging.info("SIM: ------------------------------------------------")
 
     def read(self) -> np.ndarray:
+        # --- FAILURE LOGIC START ---
+        # 1. Check for a permanent "Dead Sensor" state
+        if self.force_fatal_failure:
+            return None
+
+        # 2. Check for a random "Hardware Glitch"
+        if random.random() < self.sim_params.get("failure_rate", 0):
+            logging.warning(f"SIM: [Glitch] Simulated sensor timeout at frame {self.frame_count}")
+            return None
+        # --- FAILURE LOGIC END ---
+
         start = time.time()
         self.frame_count += 1
 
@@ -1072,10 +1093,10 @@ class FrameSimulator:
     def _render_stars(self):
         """
         Vectorised star rendering with:
-         - airmass-based atmospheric extinction  (FIX #9)
-         - altitude-dependent twinkle sigma      (FIX #13)
-         - pre-computed stamp masks for r>1 stars (FIX #6)
-         - direct star_rads indexing, no np.isin (FIX #7)
+         - airmass-based atmospheric extinction
+         - altitude-dependent twinkle sigma
+         - pre-computed stamp masks for r>1 stars
+         - direct star_rads indexing, no np.isin
         """
         p = self.sim_params
         h, w = self.height, self.width
@@ -1097,19 +1118,19 @@ class FrameSimulator:
         vx = rot_x[valid_indices].astype(np.int32)
         vy = rot_y[valid_indices].astype(np.int32)
 
-        # FIX #9 — airmass-based extinction (replaces simple quadratic)
+        # Airmass-based extinction (replaces simple quadratic)
         zenith_norm = np.clip(vy / h, 0.0, 0.999)          # 0 = zenith, ~1 = horizon
         cos_z       = np.cos(zenith_norm * (np.pi / 2))
         airmass     = 1.0 / np.maximum(cos_z, 0.05)        # avoid division by zero near 90°
         extinction  = np.exp(-p["extinction_k"] * (airmass - 1.0)).astype(np.float32)
 
-        # FIX #13 — twinkle sigma scales with altitude (more near horizon)
+        # Ttwinkle sigma scales with altitude (more near horizon)
         twinkle_sigma = (0.05 + 0.25 * zenith_norm).astype(np.float32)
         twinkle = np.random.normal(1.0, twinkle_sigma).astype(np.float32)
 
         current_colors = self.stars_colors[valid_indices] * (extinction * twinkle)[:, np.newaxis]
 
-        # FIX #7 — direct index instead of np.isin (O(n) vs O(n log n))
+        # Direct index instead of np.isin (O(n) vs O(n log n))
         rads = self.star_rads[valid_indices]
         is_small = rads == 1
 
@@ -1119,7 +1140,7 @@ class FrameSimulator:
             sy = vy[is_small]
             self.frame_buffer[sy, sx] += current_colors[is_small]
 
-        # Large stars — stamp-based (FIX #6, no per-star Python loop)
+        # Large stars — stamp-based
         for r_val in [2, 3]:
             mask_r = rads == r_val
             if not np.any(mask_r):
@@ -1208,22 +1229,16 @@ class FrameSimulator:
 
         # --- Moon disk with proper phase terminator ---
         #
-        # Clean algorithm — no flipping, no waxing/waning ambiguity:
+        # This implementation uses a SINGLE continuous illumination sweep:
         #
-        #  phase 0.00 → new moon      : dark disk only
-        #  phase 0.25 → first quarter : right half lit, terminator on left
-        #  phase 0.50 → full moon     : entire disk lit
-        #  phase 0.75 → last quarter  : left half lit, terminator on right
-        #  phase 1.00 → new moon      : dark disk only
+        #  phase 0.00 → new moon:      fully dark disk (earthshine only)
+        #  phase 0.25 → crescent:      thin lit sliver on RIGHT
+        #  phase 0.50 → half moon:     right half lit
+        #  phase 0.75 → gibbous:       most lit, thin dark sliver on LEFT
+        #  phase 1.00 → full moon:     fully lit disk
         #
-        # Steps:
-        #  1. Fill full disk with dark (earthshine) colour
-        #  2. Compute terminator ellipse x-radius from phase
-        #  3. phase < 0.5  → lit half is RIGHT  → draw right half-ellipse lit
-        #                                        → draw right half of terminator dark
-        #  4. phase >= 0.5 → lit half is LEFT   → draw left  half-ellipse lit
-        #                                        → draw left  half of terminator dark
-        #  5. Limb darkening ring
+        # Key rules:
+        #  - Illumination ALWAYS grows from RIGHT → LEFT
 
         phase = p["moon_phase_override"] if p["moon_phase_override"] >= 0 else illum
 
@@ -1246,26 +1261,6 @@ class FrameSimulator:
 
         # Step 1: full dark disk
         cv2.circle(patch, pc, r, dark_col, -1, cv2.LINE_AA)
-
-        # --- Terminator logic ---
-        # The lit area always grows from RIGHT to LEFT continuously:
-        #
-        #  phase 0.00 → new moon:      dark disk, no lit area
-        #  phase 0.25 → crescent:      thin lit sliver on right
-        #  phase 0.50 → first quarter: right half lit, terminator at centre
-        #  phase 0.75 → gibbous:       most of disk lit, thin dark crescent left
-        #  phase 1.00 → full moon:     entire disk lit
-        #
-        # The terminator is always a vertical ellipse sweeping left.
-        # Its x-radius goes from r (phase=0) to 0 (phase=0.5) to -r (phase=1).
-        # We map phase 0→1 to term_x ranging from +r to -r (linear).
-        # Positive term_x → terminator bulges RIGHT (crescent phase)
-        # Negative term_x → terminator bulges LEFT  (gibbous phase)
-        #
-        # Implementation:
-        #   Always draw RIGHT half-disk as lit.
-        #   Then draw terminator ellipse on the RIGHT side with dark colour
-        #   (phase < 0.5) or lit colour on the LEFT side (phase > 0.5).
 
         # Always light the right half first
         cv2.ellipse(patch, pc, (r, r), 0, -90, 90, lit_col, -1, cv2.LINE_AA)
@@ -1341,14 +1336,14 @@ class FrameSimulator:
             layer_info["last_reseed"] = self.frame_count
             logging.debug("SIM: Reseeding cloud layer.")
 
-        # FIX #18 — np.roll wraps the tileable canvas: whatever drifts off the
+        # Np.roll wraps the tileable canvas: whatever drifts off the
         # right edge reappears on the left (and same vertically). No seams because
         # the canvas was generated with tiling neighbours in _generate_cloud_layer.
         ox = int(layer_info["offset_x"]) % self.width
         oy = int(layer_info["offset_y"]) % self.height
         drifted = np.roll(layer_info["data"], shift=(oy, ox), axis=(0, 1))
 
-        # FIX #4 — Blend toward grey cloud colour instead of multiplying to black
+        # Blend toward grey cloud colour instead of multiplying to black
         cloud_colour = np.array(self.sim_params["cloud_grey"], dtype=np.float32)
         alpha        = drifted[..., np.newaxis]
         self.frame_buffer = self.frame_buffer * (1.0 - alpha) + cloud_colour * alpha
@@ -1362,7 +1357,7 @@ class FrameSimulator:
                 self._start_streak("airplane")
             return
 
-        # FIX #12 — Airplane strobes cycle red → green → white (realistic nav lights)
+        # Airplane strobes cycle red → green → white (realistic nav lights)
         if self.streak_type == "airplane":
             strobe_colours = [          # BGR
                 ( 50,  50, 255),   # red
@@ -1613,7 +1608,7 @@ class SFTPUploader:
         
         while not self.stop_event.is_set():
 
-            # --- PRIORITY 1: CHECK FOR POWER LOSS ---
+            # --- CHECK FOR POWER LOSS ---
             if self.pipeline_instance.power_status not in ["OK", "DISABLED"]:
                 if not was_paused_by_power_loss:
                     logging.warning("SFTP Uploader: Power loss detected. Pausing all upload activity.")
@@ -1634,7 +1629,7 @@ class SFTPUploader:
                 # sftp is already None, so the next block will force a reconnect.
                 current_reconnect_delay = INITIAL_RECONNECT_DELAY_SEC
 
-            # --- PRIORITY 2: GET A CONNECTION (STATE 1) ---
+            # --- GET A CONNECTION ---
             if sftp is None:
                 logging.info("SFTP: No active connection. Attempting to connect...")
                 ssh_client, sftp = self.connect()
@@ -1648,12 +1643,12 @@ class SFTPUploader:
                     current_reconnect_delay = min(current_reconnect_delay * 2, MAX_RECONNECT_DELAY_SEC)
                     continue
                 else:
-                    # --- NEW: Reset Backoff Logic on Success ---
+                    # --- Reset Backoff Logic on Success ---
                     logging.info("SFTP: Connection established successfully. Resetting reconnect delay.")
                     current_reconnect_delay = INITIAL_RECONNECT_DELAY_SEC
                     logging.info("SFTP: Starting to process upload queue.")
 
-            # --- PRIORITY 3: PROCESS THE QUEUE (STATE 2) ---
+            # --- PROCESS THE QUEUE ---
             # Now that we know power is OK and we have a connection, we can get a file.
             try:
                 local_path = self.upload_q.get(timeout=5)
@@ -1725,13 +1720,12 @@ class Pipeline:
     # -----------------
     # 1. INITIALIZATION & CONFIGURATION
     # -----------------
-    def __init__(self, cfg, config_path=None, simulate=False):
+    def __init__(self, cfg, config_path=None, simulate=False, force_rotation=False):
 
         self.cfg = cfg
-        
+ 
         self.config_path = config_path or "config.json"  # config path
-        self._apply_resolution_aware_tuning()
-        
+               
         # Get the base path from the janitor config. Default to the script's directory.
         base_path = self.cfg["janitor"].get("monitor_path", ".")    
         
@@ -1749,12 +1743,17 @@ class Pipeline:
         self.masterpiece_archive_dir = os.path.join(self.daylight_out_dir, "archive")
  
         self._validate_output_directories()
+        if force_rotation:
+            self._force_rotate_all_logs()
+            
+        self._setup_logging()
+        self._apply_resolution_aware_tuning()
  
         # Global stop signal for the entire application
         self.running = threading.Event()
         self.running.set()
         
-        # Separate stop signal for the capture workers
+        # Stop signal for the capture workers
         self.capture_running = threading.Event()
         self.capture_running.set()
 
@@ -1762,19 +1761,23 @@ class Pipeline:
         self.worker_threads = []
         self.control_threads = []
 
-        self.acq_q = queue.Queue(maxsize=self.effective_max_q)          # Queue for the acquisition frame
-        self.event_q = queue.Queue()                    # Queue for the event frame
-        self.timelapse_q = queue.Queue(maxsize=self.effective_max_q)    # Queue for timelapse frame
-        self.event_stack_q = queue.Queue()              # Queue for event stacks
-        self.event_log_q = queue.Queue()                # Queue for the event logger
-        self.health_q = queue.Queue()                   # Queue for health statistics
-        self.calibration_q = queue.Queue(maxsize=100)   # Queue for the calibration image
-        self.sftp_dispatch_q = queue.Queue()            # Queue for SFTP dispatcher
+        self.acq_q = queue.Queue(maxsize=self.effective_max_q)              # Queue for the acquisition frame
+        self.event_q = queue.Queue(maxsize=self.effective_max_event_q)      # Queue for the event frame
+        self.timelapse_q = queue.Queue(maxsize=self.effective_max_q)        # Queue for timelapse frame
+        self.event_stack_q = queue.Queue(maxsize=self.effective_max_event_q)# Queue for event stacks
+        self.event_log_q = queue.Queue()                                    # Queue for the event logger
+        self.health_q = queue.Queue()                                       # Queue for health statistics
+        self.calibration_q = queue.Queue(maxsize=100)                       # Queue for the calibration image
+        self.sftp_dispatch_q = queue.Queue()                                # Queue for SFTP dispatcher
         
         self.last_calibration_image_path = None
         self.is_calibrating = threading.Event()
         self.is_calibrating.clear()
         self.event_counter = 0
+
+        self.memory_critical = threading.Event()        # --- Active RAM Protection Flag ---
+        self.memory_critical.clear()
+
 
         if args.simulate:
             # Use the fake camera
@@ -1793,8 +1796,6 @@ class Pipeline:
         self.sftp_uploader = None
         if self.cfg["sftp"].get("enabled", False):
             try:
-                # Dependencies
-                # import paramiko 
                 self.sftp_uploader = SFTPUploader(self.cfg["sftp"], self)
             except ImportError:
                 logging.error("SFTP is enabled, but 'paramiko' library is not installed. Please run 'pip3 install paramiko'.")
@@ -1807,13 +1808,13 @@ class Pipeline:
             try:
                 self.led_pin = self.cfg["led_status"]["pin"]
                 
-                # 1. Create a LineSettings object to define the line's configuration.
+                # Create a LineSettings object to define the line's configuration.
                 settings = gpiod.LineSettings(
                     direction=gpiod.line.Direction.OUTPUT,
                     output_value=gpiod.line.Value.ACTIVE  # Set initial value to ON (booting)
                 )
                 
-                # 2. Request the line with the specified settings.
+                # Request the line with the specified settings.
                 self.led_line = GPIO_CHIP.request_lines(
                     consumer="meteora-pipeline-led",
                     config={self.led_pin: settings}
@@ -1853,9 +1854,9 @@ class Pipeline:
             self._safe_save_image(mip_path, dummy)
         
         self.sky_score = 0.0
+        
         self.daylight_mode_active = threading.Event()
         self.daylight_mode_active.clear()               # Default to night mode (detection on)
-        # self.mode_check_lock = threading.Lock()         # Lock to prevent race conditions during mode checks
         self.timelapse_interval_sec = self.cfg["timelapse"].get("daymode_interval_sec", 0)
         self.base_timelapse_interval = self.timelapse_interval_sec
         self.timelapse_frames_queued = 0    
@@ -1870,7 +1871,7 @@ class Pipeline:
         self.last_illuminance = "N/A"
         self.last_sky_conditions = {"stddev": "N/A", "stars": "N/A"}
         self.last_moon_status = {"impact": 0.0, "in_fov": False, "alt": 0.0, "dist": 180.0}
-        self.power_status = "DISABLED"                        # Can be OK, LOST, SHUTTING_DOWN, or DISABLED
+        self.power_status = "DISABLED"                  # Can be OK, LOST, SHUTTING_DOWN, or DISABLED
         self.last_heartbeat_status = "N/A"  
         self.noise_baseline_stddev = None
         self.last_effective_threshold = "N/A"
@@ -1897,9 +1898,9 @@ class Pipeline:
         self.initial_sftp_sweep_complete.clear()        # Start in the "not complete" state
         self.initial_janitor_check_complete = threading.Event()
         self.timelapse_complete_event = threading.Event()
-        self.timelapse_complete_event.set()         # Set initially to allow first run
+        self.timelapse_complete_event.set()             # Set initially to allow first run
         self.initial_janitor_check_complete.clear()     # Start in the "not complete" state
-        self.system_ready = threading.Event() # Master "All Systems Go" signal
+        self.system_ready = threading.Event()           # Master "All Systems Go" signal
         self.maintenance_timeout_lock = threading.Lock()
         self.maintenance_timeout_until = 0              # A timestamp indicating when the timeout expires
         self.maintenance_timeout_duration_sec = cfg["general"].get("maintenance_timeout", 300)
@@ -1908,6 +1909,9 @@ class Pipeline:
         self.background_reset_time = 0
         self.calibration_k = 0.0
         self.auto_exposure_converged = False
+        self.use_ram_for_check = True
+        self.last_light_check_source = "acquired"
+        self.snapshot_frame = None
 
         # A list of editable checkbox in the dashboard - enable / disable the relative value in the config file
         self.editable_booleans = ["auto_exposure_tuning", "auto_sensitivity_tuning", "stack_align", "astro_stretch"]
@@ -1942,6 +1946,10 @@ class Pipeline:
         
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
+        
+        logging.info("="*60)
+        logging.info(f"--- Meteora Pipeline v{self.cfg['general']['version']} Starting ---")
+        logging.info("="*60)
         logging.info("Logging started. All timestamps will be in UTC.")
     # -----------------
     def _initial_cleanup(self):
@@ -1982,7 +1990,8 @@ class Pipeline:
             "data_written_mb": 0.0,
             "peak_cpu_temp": 0.0,
             "avg_lux": [],
-            "sky_history": []
+            "sky_history": [],
+            "bias_history":[]
         }
     # -----------------
     def _load_chronicle(self):
@@ -2061,9 +2070,9 @@ class Pipeline:
         den = sum((xs[i] - mx) ** 2 for i in range(n))
         slope = num / den if den > 0 else 0.0
         # Classify
-        if slope >  0.08:  trend = "improving";  verb = "steadily improved"
-        elif slope < -0.08: trend = "degrading";  verb = "gradually degraded"
-        else:               trend = "stable";     verb = "remained stable"
+        if slope >  0.08: trend = "improving"; verb = "steadily improved"
+        elif slope < -0.08: trend = "degrading"; verb = "gradually degraded"
+        else: trend = "stable"; verb = "remained stable"
         best  = max(sky_history, key=lambda h: h["score"])
         worst = min(sky_history, key=lambda h: h["score"])
         best_t  = datetime.fromtimestamp(best["t"],  tz=timezone.utc).strftime("%H:%M")
@@ -2095,17 +2104,18 @@ class Pipeline:
         
         profile = RESOLUTION_TUNING_PROFILES[best_match_mp]
         
-        # logging.warning(f"--- AUTO-TUNING ACTIVATED ({w}x{h} = {mp:.1f}MP) ---")
         logging.warning(f"Applying '{best_match_mp}MP' Tuning Profile.")
-        # logging.warning(f"--- RESOLUTION AWARE ENGINE: {mp:.1f}MP detected ---")
 
+        self.description = profile["description"]
         self.min_area = profile["min_area"]
         self.min_changes_required = profile["min_changes"]
         self.star_mask_radius = profile["radius"]
         self.alignment_contrast_floor = profile["std_floor"]
-        user_max_q = self.cfg["general"].get("max_queue_size", 1000)
-        self.effective_max_q = min(user_max_q, profile["max_q"])
+        self.effective_max_q = profile["max_q"]
+        self.effective_max_event_frames = profile.get("max_event_frames", 150)
+        self.effective_max_event_q = profile["max_event_q"] 
         
+        logging.info(f"Tuning profile select: {self.description}")
         logging.info(f"Parameters set: Area>{self.min_area}, Motion>{self.min_changes_required}, MaskRadius={self.star_mask_radius}")
     # -----------------
     # 2. LIFECYCLE & MASTER SCHEDULER
@@ -2113,9 +2123,7 @@ class Pipeline:
     def run(self):
         """
         The main entry point to start and run the entire pipeline application.
-        """
-        self._setup_logging()
-        
+        """ 
         shutdown_event = threading.Event()
         def handle_signal(sig, frame):
             if not shutdown_event.is_set():
@@ -2126,9 +2134,9 @@ class Pipeline:
         signal.signal(signal.SIGINT, handle_signal)
         signal.signal(signal.SIGTERM, handle_signal)
         
-        logging.info("="*60)
-        logging.info(f"--- Meteora Pipeline v{self.cfg['general']['version']} Starting ---")
-        logging.info("="*60)
+        # logging.info("="*60)
+        # logging.info(f"--- Meteora Pipeline v{self.cfg['general']['version']} Starting ---")
+        # logging.info("="*60)
         self.log_health_event("WARNING", "START", "The system is starting.")
         
         self.start()
@@ -2207,7 +2215,6 @@ class Pipeline:
         ]
 
         # 2. Add optional control threads based on configuration
-              
         if self.cfg["power_monitor"].get("enabled", False) and IS_GPIO_AVAILABLE:
             self.control_threads.append(threading.Thread(target=self.power_monitor_loop, name="PowerMonitorThread", daemon=True))
         else:
@@ -2295,14 +2302,14 @@ class Pipeline:
         logging.warning("Pausing watchdog for final shutdown procedure.")
         self.watchdog_pause.set()
                                                
-        # --- Phase 1: Stop all new data production ---
+        # --- Stop all new data production ---
         logging.info("Setting global stop signal for all threads.")
         self.running.clear() # Global stop signal
         
-        # --- Phase 2: Specifically stop the data production chain first ---
+        # --- Specifically stop the data production chain first ---
         self.stop_producer_thread() # This now handles both Capture and Detection
 
-        # --- Phase 3: Signal all consumer and control threads to terminate ---
+        # --- Signal all consumer and control threads to terminate ---
         logging.info("Posting final sentinels to all remaining worker and control queues...")
         queues_to_signal = [
             self.timelapse_q, self.event_q, self.event_stack_q,
@@ -2315,10 +2322,10 @@ class Pipeline:
             try: q.put_nowait(None)
             except (queue.Full, AttributeError): pass
             
-        # --- Phase 4: Wait for all remaining threads to finish cleanly ---
+        # --- Wait for all remaining threads to finish cleanly ---
         logging.info("Waiting for all threads to complete their final tasks...")
         all_threads = self.worker_threads + self.control_threads
-        shutdown_timeout = 10 # seconds
+        shutdown_timeout = 30 # seconds
 
         for t in all_threads:
             if t == threading.current_thread() or t.name == "DashboardThread" or not t.is_alive():
@@ -2328,7 +2335,7 @@ class Pipeline:
             if t.is_alive():
                 logging.error(f"Thread '{t.name}' failed to join and is still alive. Shutdown may be incomplete.")
 
-        # --- Phase 5: Release hardware resources ---
+        # --- Release hardware resources ---
         if self.camera:
             try:
                 self.camera.release()
@@ -2374,10 +2381,7 @@ class Pipeline:
             # --- Scheduled System Shutdown Check ---
             if shutdown_time and now_str == shutdown_time:
                 logging.warning(f"Scheduler: Reached scheduled shutdown time ({shutdown_time}).")
-                # 1. Trigger video creation
-                self.start_timelapse_video_creation()
-                
-                # 2. Wait for the video thread to finish (if it started)
+                # Wait for the video thread to finish
                 video_thread = next((t for t in threading.enumerate() if t.name == "TimelapseVideoThread"), None)
                 
                 if video_thread and video_thread.is_alive():
@@ -2393,7 +2397,7 @@ class Pipeline:
                     else:
                         logging.error("Scheduler: Video creation timed out! Forcing shutdown anyway.")
                 
-                # 3. Perform Shutdown
+                # Perform Shutdown
                 logging.info("Scheduler: Proceeding with system shutdown sequence.")
                 time.sleep(2) # Final buffer for log flushing
                 self.perform_system_action("shutdown", reason="Scheduled Daily Shutdown")
@@ -2412,13 +2416,13 @@ class Pipeline:
                     time.sleep(1)
                 continue # Skip the rest of the scheduler logic   
 
-            if self.camera_fatal_error.is_set():  # the camera reach max_camera_failures
+            if self.camera_fatal_error.is_set():    # the camera reach max_camera_failures
                 logging.error("Scheduler detected fatal camera error. Attempting restart (%d/%d)...", self.consecutive_restart_failures + 1, max_restart_attempts)
                 self.log_health_event("ERROR", "CAMERA_DETECT_FAIL", "Fatal camera error.")
-                self.stop_producer_thread() # Ensure it's fully stopped
+                self.stop_producer_thread()         # Ensure it's fully stopped
                 time.sleep(0.1)
-                self.camera_fatal_error.clear() # Reset for new attempt
-                self.start_producer_thread() # Attempt restart
+                self.camera_fatal_error.clear()     # Reset for new attempt
+                self.start_producer_thread()        # Attempt restart
                 
                 # Wait a moment to potentially fail again or stabilize
                 time.sleep(10) 
@@ -2496,8 +2500,6 @@ class Pipeline:
                     logging.info("Scheduler: Outside the schedule time.")
                                
             # Wait for 60 seconds before the next check.
-            # if self.running.wait(timeout=60):
-                # break
             for _ in range(60):
                 if not self.running.is_set(): break
                 time.sleep(1)
@@ -2540,9 +2542,9 @@ class Pipeline:
         mean_lux = np.mean(s["avg_lux"]) if s["avg_lux"] else 0.0
         
         # Calculate derived metrics
-        filtered_noise = s["rejected_contours"]
-        actual_captures = s["accepted_events"]
-        total_pulsations = s["total_events"]
+#        filtered_noise = s["rejected_contours"]
+#        actual_captures = s["accepted_events"]
+#        total_pulsations = s["total_events"]
         
         clarity = (s["clear_sky_minutes"] / max(1, s["clear_sky_minutes"] + s["cloudy_sky_minutes"]) * 100)
         sky_avg = np.mean(s["avg_sky_score"]) if s["avg_sky_score"] else 0.0
@@ -2552,8 +2554,8 @@ class Pipeline:
         self._update_chronicle(s, hours, sky_avg, clarity, s.get("sky_history", []))
 
         eff = 100.0
-        if total_pulsations > 0:
-            eff = 100 - (filtered_noise / total_pulsations * 100)        
+        if s["total_events"] > 0:
+            eff = 100 - (s["rejected_contours"] / s["total_events"] * 100)        
         
         lines = [f"THE WATCHMAN'S JOURNAL | Night of {s['start_time'].strftime('%B %d, %Y')} Session Ending"]
         lines.append("-" * 60)
@@ -2564,16 +2566,12 @@ class Pipeline:
         if s["max_moon_impact"] > 0.1:
             lines.append(f"• LUNAR INFLUENCE: The Moon was in FOV for {s['moon_visible_minutes']:.2f}m (Max Impact: {int(s['max_moon_impact']*100)}%).")
         
-        lines.append(f"• CAPTURES: Successfully isolated {s['accepted_events']} valid celestial events.")
-        lines.append(f"• EFFICIENCY: Analyzed {total_pulsations:,} potential triggers; ignored {filtered_noise:,} noise artifacts ({eff:.1f}% accuracy).")
+        lines.append(f"• EFFICIENCY: Analyzed {s["total_events"]:,} potential triggers; ignored {s["rejected_contours"]:,} noise artifacts ({eff:.1f}% accuracy).")
 
-        lines.append(f"• DETECTIONS: Isolated {actual_captures} candidate celestial events.")
+        lines.append(f"• DETECTIONS: Isolated {s["accepted_events"]} candidate celestial events.")
         
         lines.append(f"• STORAGE: Recorded {s["data_written_mb"]:.1f} MB of new astronomical data to disk.")
         
-        # if self.sftp_uploader:
-            # lines.append(f"• DATA SYNC: {s['sftp_success_count']} files successfully transmitted to the remote archive.")
-
         lines.append(f"• VITALS: Peak operating temperature: {s['peak_cpu_temp']:.1f}°C.")
         
         lines.append(f"• ATMOSPHERE: {fp['summary']}")
@@ -2586,16 +2584,163 @@ class Pipeline:
                 f"Sky quality {ctx['score_pct']}th percentile."
             )
         
-        lines.append("-" * 60)
-        lines.append("I am now resting. Monitoring the atmosphere for the next start.")
-
-        # Save historical text file
+        # --- GRAPH GENERATION ---
+        pdf_supported = True
+        plot_path = None
         try:
-            rpt_name = s["start_time"].strftime("journal_%Y%m%d.txt")
-            with open(os.path.join(self.general_log_dir, rpt_name), 'w') as f:
-                f.write("\n".join(lines))
-        except (IOError, OSError) as e:
-            logging.warning("Could not write journal file: %s", e)
+            matplotlib.use('Agg') # Safe for headless Pi
+            
+            # Use dark background for a "Mission Control" aesthetic
+            plt.style.use('dark_background')
+            
+            if s.get("sky_history") or s.get("bias_history"):
+                fig, ax1 = plt.subplots(figsize=(9, 4), facecolor='#1e1e1e')
+                ax1.set_facecolor('#1e1e1e')
+                
+                # Plot Sky Score (Neon Blue Line)
+                if s.get("sky_history"):
+                    times_sky = [datetime.fromtimestamp(h["t"], tz=timezone.utc) for h in s["sky_history"]]
+                    scores = [h["score"] for h in s["sky_history"]]
+                    ax1.plot(times_sky, scores, color='#61afef', marker='o', markersize=4, linestyle='-', linewidth=2, label='Sky Score')
+                    ax1.set_ylabel('Sky Score (1.0 = Ideal)', color='#61afef', fontweight='bold')
+                    ax1.tick_params(axis='y', colors='#61afef')
+                    
+                    ax1.axhline(y=SKY_SCORE_VALUES["excellent"], color='#555555', linestyle='--', alpha=0.8, label='Excellent Threshold')
+                    ax1.axhline(y=SKY_SCORE_VALUES["good"], color='#555555', linestyle='--', alpha=0.8, label='Good Threshold')
+                    ax1.axhline(y=SKY_SCORE_VALUES["fair"], color='#555555', linestyle='--', alpha=0.8, label='Cloudy Threshold')
+                    ax1.grid(color='#333333', linestyle=':', alpha=0.7)
+                
+                # Plot Bias Mode (Crimson Red Shaded Regions)
+                if s.get("bias_history"):
+                    times_bias =[datetime.fromtimestamp(h["t"], tz=timezone.utc) for h in s["bias_history"]]
+                    bias_vals = [1 if h["bias"] else 0 for h in s["bias_history"]]
+                    ax2 = ax1.twinx()
+                    ax2.fill_between(times_bias, 0, bias_vals, color='#e06c75', alpha=0.35, step='post', label='Tracking Lost')
+                    ax2.set_ylabel('Tracking Lost (Bias Mode)', color='#e06c75', fontweight='bold')
+                    ax2.set_yticks([0, 1])
+                    ax2.set_yticklabels(['Locked', 'Lost'])
+                    ax2.tick_params(axis='y', colors='#e06c75')
+                    ax2.set_ylim(0, 1.1)
+
+                ax1.set_xlabel('Time (UTC)', color='#aaaaaa')
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+                ax1.tick_params(axis='x', colors='#aaaaaa')
+                
+                plt.title(f"Atmospheric Stability & Tracking Telemetry", color='#ffffff', pad=15)
+                fig.tight_layout()
+                
+                plot_path = os.path.join(self.general_log_dir, f"temp_plot_{int(time.time())}.png")
+                # Save with the dark background color
+                plt.savefig(plot_path, dpi=200, facecolor=fig.get_facecolor(), edgecolor='none')
+                plt.close(fig)
+        except ImportError:
+            pdf_supported = False
+            logging.warning("Matplotlib/fpdf2 not installed. Falling back to TXT journal. Run: pip3 install fpdf2 matplotlib")
+        except Exception as e:
+            pdf_supported = False
+            logging.error(f"Failed to generate journal graph: {e}")
+
+        # --- 2. DOCUMENT GENERATION (Elegant PDF) ---
+        rpt_name_base = s["start_time"].strftime("journal_%Y%m%d")
+        
+        if pdf_supported:
+            try:
+                pdf_path = os.path.join(self.general_log_dir, rpt_name_base + ".pdf")
+                pdf = FPDF()
+                pdf.add_page()
+                
+                # --- PDF Styling ---
+                C_DARK = (40, 44, 52)      # Deep grey/blue for headers
+                C_ACCENT = (198, 120, 221) # Meteora Purple
+                C_TEXT = (80, 80, 80)      # Soft grey for text
+                
+                # --- Header ---
+                pdf.set_font("Helvetica", "B", 20)
+                pdf.set_text_color(*C_DARK)
+                pdf.cell(0, 10, text="METEORA OBSERVATORY", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                
+                pdf.set_font("Helvetica", "I", 12)
+                pdf.set_text_color(*C_ACCENT)
+                pdf.cell(0, 6, text=f"The Watchman's Journal - {s['start_time'].strftime('%B %d, %Y')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                pdf.ln(8)
+                
+                # --- Helper Function for Clean Grids ---
+                def add_section(title, data_dict):
+                    pdf.set_font("Helvetica", "B", 12)
+                    pdf.set_text_color(*C_ACCENT)
+                    pdf.cell(0, 8, text=title.upper(), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                    
+                    # Draw subtle underline
+                    pdf.set_draw_color(*C_ACCENT)
+                    pdf.set_line_width(0.4)
+                    y = pdf.get_y()
+                    pdf.line(10, y, 200, y)
+                    pdf.ln(3)
+
+                    for k, v in data_dict.items():
+                        pdf.set_font("Helvetica", "B", 10)
+                        pdf.set_text_color(*C_DARK)
+                        pdf.cell(50, 6, text=k, new_x=XPos.RIGHT)
+                        
+                        pdf.set_font("Helvetica", "", 10)
+                        pdf.set_text_color(*C_TEXT)
+                        # Sanitize strings for FPDF
+                        safe_v = str(v).replace('•', '*').replace('°', ' deg').replace('—', '-')
+                        safe_v = safe_v.encode('latin-1', 'ignore').decode('latin-1')
+                        pdf.multi_cell(0, 6, text=safe_v, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                    pdf.ln(4)
+
+                # --- Build Sections ---
+                add_section("Mission Parameters", {
+                    "Vigilance Kept:": f"{hours:.1f} hours",
+                    "Average Illuminance:": f"{mean_lux:.4f} Lux",
+                    "Peak Temperature:": f"{s['peak_cpu_temp']:.1f} °C",
+                    "Data Recorded:": f"{s['data_written_mb']:.1f} MB",
+                })
+                
+                add_section("Detection Analytics", {
+                    "Sky Clarity:": f"{clarity:.1f}% (Avg Score: {sky_avg:.2f})",
+                    "Celestial Events:": f"{s["accepted_events"]} isolated",
+                    "Detector Efficiency:": f"{eff:.1f}% ({s["rejected_contours"]:,} noise artifacts rejected)",
+                })
+                
+                if ctx:
+                    add_section("Historical Chronicle", {
+                        "Database Size:": f"{ctx['nights_total']} recorded nights",
+                        "Event Ranking:": f"{ctx['events_pct']}th percentile (Tonight: {ctx['events_tonight']}, Avg: {ctx['events_avg']:.1f})",
+                        "Sky Quality:": f"{ctx['score_pct']}th percentile",
+                    })
+                
+                add_section("Atmospheric Telemetry", {
+                    "Night Trend:": fp['summary'],
+                    "Lunar Impact:": f"In FOV for {s['moon_visible_minutes']:.1f}m (Max Flare: {int(s['max_moon_impact']*100)}%)" if s["max_moon_impact"] > 0.1 else "None",
+                })
+
+                # --- Insert Graph ---
+                if plot_path and os.path.exists(plot_path):
+                    pdf.ln(2)
+                    pdf.image(plot_path, x=10, w=190) # Fits perfectly on A4
+                    os.remove(plot_path) # Cleanup
+                    
+                # --- Footer Quote ---
+                pdf.ln(6)
+                pdf.set_font("Helvetica", "I", 9)
+                pdf.set_text_color(150, 150, 150)
+                pdf.cell(0, 6, text="\"The stars are the streetlights of eternity.\" - Meteora Intelligence", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+
+                pdf.output(pdf_path)
+                logging.info(f"Morning Journal PDF successfully generated: {pdf_path}")
+            except Exception as e:
+                logging.error(f"Failed to compile PDF: {e}")
+                
+        if not pdf_supported or not os.path.exists(pdf_path):
+            # Fallback to standard Text File if PDF failed
+            txt_path = os.path.join(self.general_log_dir, rpt_name_base + ".txt")
+            try:
+                with open(txt_path, 'w') as f:
+                    f.write("\n".join(lines))
+            except Exception as e:
+                logging.warning(f"Could not write txt journal file: {e}")
 
         return "\n".join(lines)
     # -----------------
@@ -2631,9 +2776,10 @@ class Pipeline:
 
         if not threads_to_stop:
             logging.warning("stop_producer_thread was called, but no producer threads were found running.")
+            
             return
 
-        # 1. Pause Watchdog
+        # Pause Watchdog
         try:
             logging.warning("Pausing watchdog for producer thread shutdown procedure.")
             self.watchdog_pause.set()
@@ -2642,10 +2788,10 @@ class Pipeline:
             logging.info("Resuming watchdog. Producer threads will now be joined.")
             self.watchdog_pause.clear()
 
-        # 2. Signal Shutdown
+        # Signal Shutdown
         self.capture_running.clear()
         
-        # 3. Force "Poison Pill" into Queue (Critical for DetectionThread)
+        # Force "Poison Pill" into Queue (Critical for DetectionThread)
         # If queue is full, drain one item to make room for the sentinel
         try:
             self.acq_q.put_nowait(None)
@@ -2658,7 +2804,7 @@ class Pipeline:
         logging.info("Resetting background model for next session.")
         self.background = None
 
-        # 4. Dynamic Timeout Calculation
+        # Dynamic Timeout Calculation
         # Calculate safe timeout based on current exposure. 
         # Formula: (Exposure_Seconds * 2) + 10s Buffer. Min 15s.
         current_exp_sec = self.cfg["capture"].get("exposure_us") / 1000000
@@ -2667,7 +2813,7 @@ class Pipeline:
 
         logging.info(f"Waiting for producer threads to terminate (Timeout: {safe_timeout:.1f}s)...")
 
-        # 5. BREAK HARDWARE BLOCK (The Fix for Long Exposures)
+        # BREAK HARDWARE BLOCK (The Fix for Long Exposures)
         # If we are in long exposure, read() blocks. We force the camera to stop NOW.
         if self.camera and hasattr(self.camera, 'picam2'):
             try:
@@ -2677,7 +2823,7 @@ class Pipeline:
             except Exception: 
                 pass # Camera might already be stopped
 
-        # 6. Join Threads
+        # Join Threads
         for thread in threads_to_stop:
             while thread.is_alive():
                 if time.time() > shutdown_deadline:
@@ -2692,6 +2838,12 @@ class Pipeline:
             if not thread.is_alive():
                 logging.info(f"Thread '{thread.name}' has successfully terminated.")
 
+        # --- Tell the Timelapse Thread to process its partial buffer ---
+        try:
+            self.timelapse_q.put_nowait("FLUSH")
+        except queue.Full:
+            pass
+
         logging.info("Data production chain has been cleanly stopped.")
     # -----------------
     def update_worker_list(self, threads_to_stop):
@@ -2700,8 +2852,8 @@ class Pipeline:
             logging.warning("stop_producer_thread called but no producer threads were found running.")
             return
 
-        # 2. Immediately remove these threads from the main worker list.
-        #    This is the key step that prevents the watchdog race condition.
+        # Immediately remove these threads from the main worker list.
+        # This is the key step that prevents the watchdog race condition.
         self.worker_threads = [t for t in self.worker_threads if t not in threads_to_stop]
         logging.info(f"Removed {[t.name for t in threads_to_stop]} from watchdog monitoring list.")
     # -----------------
@@ -2744,6 +2896,9 @@ class Pipeline:
             
             # If a frame is read successfully, reset the global counter
             self._reset_camera_failure()
+
+            # --- Save the last raw frame to RAM ---
+            self.last_raw_frame = frame 
             
             try:
                 self.acq_q.put_nowait((ts, frame.copy()))
@@ -2767,8 +2922,74 @@ class Pipeline:
         # Use a lock to ensure the capture_loop pauses while we change settings.
         with self.camera_lock:
             try:
-                # 1. Temporarily switch to auto-exposure to get a good light reading
-                self._set_camera_preset("DAY")
+                # --- OPTIMIZATION: RAM-BASED FAST-PATH LIGHT CHECK ---
+                # If we are in stable NIGHT mode, we check the last frame already in RAM!
+                if not self.daylight_mode_active.is_set() and getattr(self, "auto_exposure_converged", False):
+                    
+                    # Toggle between memory and hardware to guarantee accuracy
+                    self.use_ram_for_check = not getattr(self, "use_ram_for_check", False)
+                    
+                    meta = {}
+                    if self.use_ram_for_check:
+                        logging.info("Fast Light Check: Using memory frame.")
+                        frame = getattr(self, "last_raw_frame", None)
+                        current_check_source = "memory"
+                    else:
+                        logging.info("Fast Light Check: Forcing hardware frame to ensure accuracy.")
+                        try:
+                            # --- FIX: Grab the frame AND the metadata directly from the hardware! ---
+                            req = self.camera.picam2.capture_request()
+                            img_array = req.make_array("main")
+                            meta = req.get_metadata()
+                            req.release()
+                            
+                            if img_array is not None:
+                                bgr_8bit = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                                frame = (bgr_8bit.astype(np.uint16) * 256)
+                            else:
+                                frame = None
+                            current_check_source = "acquired"
+                        except Exception as e:
+                            logging.warning(f"Hardware frame request failed: {e}")
+                            frame = None
+
+                    if frame is not None:
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        mean_bright = float(np.mean(gray)) / 256.0
+                        
+                        # Lowered threshold to 150.0 to catch morning twilight safely
+                        if mean_bright < 150.0:
+                            # --- NEW: CALCULATE REAL K FROM THE NIGHT SKY! ---
+                            if current_check_source == "acquired" and "Lux" in meta and meta["Lux"] > 0:
+                                hw_lux = meta["Lux"]
+                                hw_exp = meta.get("ExposureTime", self.current_exposure_us)
+                                hw_gain = meta.get("AnalogueGain", self.current_gain)
+                                
+                                exposure_sec = hw_exp / 1_000_000.0
+                                denominator = (hw_lux * exposure_sec * hw_gain)
+                                
+                                if denominator > 0:
+                                    self.calibration_k = mean_bright / denominator
+                                    self.camera_k_logger()
+                                    logging.info(f"Night Calibration: True K updated from deep sky frame (k={self.calibration_k:.2f})")
+                                
+                                current_lux = hw_lux
+                            else:
+                                # Memory path (or metadata missing): Calculate lux using our established K
+                                current_lux = self.calculate_lux(mean_bright, self.current_exposure_us, self.current_gain)
+
+                            with self.status_lock:
+                                self.session_stats["avg_lux"].append(current_lux)
+                                self.last_illuminance = f"{current_lux:.5f}"
+                                self.last_light_check_source = current_check_source
+                            
+                            logging.info(f"Fast Light Check: {current_lux:.5f} Lux (Night confirmed, skipped DAY preset).")
+                            return True
+                        else:
+                            logging.info("Fast Light Check: Frame saturated (Twilight). Proceeding to full DAY check.")
+              
+                # Temporarily switch to auto-exposure to get a good light reading
+                self._set_camera_preset("SNAP")
                 # time.sleep(2) # Allow sensor to adjust
                 frame = None
                 metadata = {}
@@ -2801,11 +3022,11 @@ class Pipeline:
                 if frame is None:
                     return False # Thread was stopped
 
-                # 2. Capture the hardware's baseline choices
+                # Capture the hardware's baseline choices
                 hw_exp = metadata.get("ExposureTime", self.current_exposure_us)
                 hw_gain = metadata.get("AnalogueGain", self.current_gain) 
 
-                # 3. Analyze the actual brightness of the hardware's auto-frame
+                # Analyze the actual brightness of the hardware's auto-frame
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 mean_bright = float(np.mean(gray)) / 256.0 
                 
@@ -2814,7 +3035,7 @@ class Pipeline:
                 self.ae_hw_gain = hw_gain
                 self.ae_hw_brightness = mean_bright
                 
-                # 4. Failsafe for missing Lux 
+                # Failsafe for missing Lux 
                 if "Lux" not in metadata:
                     logging.warning("'Lux' missing from metadata. Estimating manually...")
                     # Rough fallback estimate if the sensor driver fails
@@ -2825,6 +3046,7 @@ class Pipeline:
                 with self.status_lock:
                     self.session_stats["avg_lux"].append(current_lux)
                     self.last_illuminance = f"{current_lux:.2f}"
+                    self.last_light_check_source = "acquired (SNAP preset)"
                     
                 _, moon_in_fov, _, _ = self.get_moon_state()
                 
@@ -2832,13 +3054,14 @@ class Pipeline:
 
                 # --- CALCULATE CALIBRATION K ---
                 # Formula: K = Brightness / (Lux * Exposure_sec * Gain)
-                if frame is not None and current_lux > 0:
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    mean_brightness = float(np.mean(gray)) / 256.0  # Use Mean!
-                    
+                if frame is not None and current_lux > 0:  
+#                if current_lux > 0:   # frame already checked
+#                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+#                    mean_brightness = float(np.mean(gray)) / 256.0  # Use Mean!
+
                     exposure_sec = hw_exp / 1_000_000.0
                     denominator = (current_lux * exposure_sec * hw_gain)
-                    
+                
                     if denominator > 0:
                         self.calibration_k = mean_brightness / denominator
                         self.camera_k_logger()
@@ -2866,8 +3089,6 @@ class Pipeline:
                         self.current_exposure_us = night_exposure_us
                         self.current_gain = night_gain
 
-                    # self._set_camera_preset("NIGHT")
-
                 return True
 
             except Exception:
@@ -2893,7 +3114,7 @@ class Pipeline:
         safe_night_exp = self.current_exposure_us
         safe_night_gain = self.current_gain
 
-        # 1. Target calculation based on moon interference
+        # Target calculation based on moon interference
         moon_impact, in_fov, _, _ = self.get_moon_state()
         base_target = cfg.get("target_sky_brightness", 15)
         target = base_target + (15 * moon_impact) if in_fov else base_target
@@ -2907,9 +3128,7 @@ class Pipeline:
         min_gain, max_gain = cfg["min_gain"], cfg["max_gain"]
         min_exp, max_exp = cfg["min_exposure_us"], cfg["max_exposure_us"]
 
-        # # 2. Grab the Hardware Baseline captured milliseconds ago
-
-        # 2. Determine Initial Guess
+        # Determine Initial Guess
         if not getattr(self, "auto_exposure_converged", False):
             # FIRST RUN: Grab the Hardware Baseline captured milliseconds ago
             hw_exp = getattr(self, "ae_hw_exposure", self.current_exposure_us)
@@ -2942,41 +3161,43 @@ class Pipeline:
         new_exposure = int(max(min_exp, min(max_exp, new_exposure)))
         new_gain = float(max(min_gain, min(max_gain, new_gain)))
 
-        # 3. The Verification Loop
+        # The Verification Loop
         for attempt in range(max_attempts):
+            # --- ANTI-LOOP: Track the values we are testing to detect if we get stuck ---
+            test_exp = new_exposure
+            test_gain = new_gain
             logging.info(f"Auto-exposure Attempt {attempt + 1}/{max_attempts} — Exp: {new_exposure}us | Gain: {new_gain:.2f}")
 
             with self.camera_lock:
-                self._set_camera_preset("NIGHT", ExposureTime=new_exposure, AnalogueGain=new_gain)
-                frame = self.camera.read()
+                # Get the frame directly from the preset flush!
+                success, synced_frame = self._set_camera_preset("NIGHT", ExposureTime=new_exposure, AnalogueGain=new_gain)
+                frame = synced_frame if synced_frame is not None else self.camera.read()
 
             if frame is None:
-                self._register_camera_failure() # <--- Track the failure
+                self._register_camera_failure()
                 logging.error("Auto-exposure: Frame capture failed during verification. Reverting to hardware baseline.")
-                # self.current_exposure_us = int(hw_exp)
-                # self.current_gain = float(hw_gain)
                 self.current_exposure_us = safe_night_exp
                 self.current_gain = safe_night_gain
+                self.snapshot_frame = None
                 return
             
             self._reset_camera_failure() # <--- Reset on success
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # actual_brightness = float(np.median(gray))
-            # actual_brightness = float(np.mean(gray))
             actual_brightness = float(np.mean(gray)) / 256.0
 
             logging.info(f"Auto-exposure Verification: Actual Brightness={actual_brightness:.1f} (Target={target:.1f} ±{tolerance})")
 
-            # --- Check 1: Did we hit the target? ---
+            # --- Did we hit the target? ---
             if (target - tolerance) <= actual_brightness <= (target + tolerance):
                 logging.info(f"Auto-exposure: Target accurately acquired on attempt {attempt + 1}.")
                 self.current_exposure_us = new_exposure
                 self.current_gain = new_gain
                 self.auto_exposure_converged = True
-                return  # Success! Exit immediately.
+                self.snapshot_frame = frame
+                return  # Success
 
-            # --- Check 2: Calculate Correction for Next Attempt ---
+            # --- Calculate Correction for Next Attempt ---
             if attempt < max_attempts - 1:  # If we have more attempts left
                 if actual_brightness > effective_max:
                     # SATURATED: Drastic failsafe reduction
@@ -2997,7 +3218,7 @@ class Pipeline:
                     else:
                         correction_ratio = max(correction_ratio, 0.3)  # Max ~3x decrease per step
                     
-                    # --- FIX: Treat Exposure and Gain as a single pooled product ---
+                    # Treat Exposure and Gain as a single pooled product
                     current_product = new_exposure * new_gain
                     required_product = current_product * correction_ratio
                     
@@ -3012,6 +3233,15 @@ class Pipeline:
                 # Re-clamp the corrected values before the next verification loop
                 new_exposure = int(max(min_exp, min(max_exp, new_exposure)))
                 new_gain = float(max(min_gain, min(max_gain, new_gain)))
+                
+                # --- ANTI-LOOP FAILSAFE ---
+                if new_exposure == test_exp and new_gain == test_gain:
+                    logging.warning(f"Auto-exposure: Pinned against config limits. Cannot reach target {target:.1f}. Settling for {actual_brightness:.1f}")
+                    self.current_exposure_us = new_exposure
+                    self.current_gain = new_gain
+                    self.auto_exposure_converged = True
+                    self.snapshot_frame = frame
+                    return
             else:
                 # We reached max_attempts without perfectly hitting the target
                 logging.warning(f"Auto-exposure: Max attempts reached. Settling for Brightness={actual_brightness:.1f}")
@@ -3021,16 +3251,19 @@ class Pipeline:
                 self.current_exposure_us = safe_night_exp
                 self.current_gain = safe_night_gain
                 self.auto_exposure_converged = True
+                self.snapshot_frame = None
     # -----------------
     def calculate_lux(self, brightness, exposure_us, gain):
+        # If the exposure is not set to auto, the sensor did not return the lux value as metadata.
         # Formula: Lux = Brightness / (K * Exposure_sec * Gain)
-        k_val = self.calibration_k if (self.calibration_k and self.calibration_k > 0) else 20.0
+        # k_val = self.calibration_k if (self.calibration_k and self.calibration_k > 0) else 20.0
+        k_val = self.calibration_k if (self.calibration_k and self.calibration_k > 0.5) else 20.0
         
         exposure_s = exposure_us / 1_000_000.0
         
         denominator = k_val * exposure_s * gain
         
-        # 4. Safety Check (Prevent Division by Zero)
+        # Safety Check (Prevent Division by Zero)
         if denominator <= 0.000001:
             return 0.0       
 
@@ -3043,15 +3276,13 @@ class Pipeline:
         collects N of them, stacks them, and saves the result.
         """
         logging.info("Calibration worker started, waiting for triggered frames.")
-        # calib_cfg = self.cfg.get("calibration", {})
 
         while self.running.is_set():
             try:
-                # 1. Wait for the very first frame to arrive.
+                # Wait for the very first frame to arrive.
                 first_frame_item = self.calibration_q.get(timeout=10)
                 
                 if first_frame_item is None:
-                    # continue
                     break
                     
                 stack_n = self.cfg["timelapse"].get("stack_N", 10)
@@ -3063,7 +3294,7 @@ class Pipeline:
                 frames_for_stack = [first_frame_item]
                 capture_ok = True
 
-                # 2. Collect the REMAINING frames.
+                # Collect the REMAINING frames.
                 for i in range(stack_n - 1):
                     if not self.running.is_set():
                         capture_ok = False
@@ -3081,10 +3312,10 @@ class Pipeline:
                         capture_ok = False
                         break
                 
-                # 3. Process the collected frames if everything went well.
+                # Process the collected frames if everything went well.
                 if capture_ok:
                     logging.info("Stacking %d frames for calibration image...", len(frames_for_stack))
-                    stacked_image, _ = self.stack_frames(
+                    stacked_image, _, _ = self.stack_frames(
                         [f for _, f in frames_for_stack],
                         align=self.cfg["timelapse"]["stack_align"],
                         method="mean",
@@ -3111,7 +3342,7 @@ class Pipeline:
                 with self.status_lock:
                     self.last_calibration_error = error_msg
             finally:
-                # 4. CRITICAL: Always reset the state for the next run.
+                # CRITICAL: Always reset the state for the next run.
                 # Clear the trigger so the detection_loop stops sending frames.
                 # Drain any extra frames that might have queued up during stacking.
                 if self.is_calibrating.is_set():
@@ -3127,14 +3358,13 @@ class Pipeline:
     # -----------------
     def _set_camera_preset(self, mode="NIGHT", **overrides):
         """
-        Central authority for camera hardware.
-        Modes: 'NIGHT' (Manual Hunt), 'DAY' (Auto), 'SNAP' (Long Exp Snapshot)
+        Camera mode.
         """
-        # 1. Determine the target exposure first so we can sync FrameDurationLimits
+        # Determine the target exposure first so we can sync FrameDurationLimits
         target_exp = overrides.get("ExposureTime", self.current_exposure_us)
         target_gain = overrides.get("AnalogueGain", self.current_gain)
 
-        # 2. Define the base templates using current config/state
+        # Define the base templates using current config/state
         presets = {
             "NIGHT": {
                 "ExposureTime": int(target_exp),
@@ -3150,30 +3380,30 @@ class Pipeline:
                 "FrameDurationLimits": (1000, 33333) 
             },
             "SNAP": {
-                "ExposureTime": int(self.cfg["capture"].get("snap_exposure_us")),
-                "AnalogueGain": float(self.cfg["capture"].get("snap_gain", 4.0)),
+                # Short manual exposure — bright enough that the day to not saturate,
+                # long enough at night that the ISP can compute a meaningful Lux value.
                 "AeEnable": False,
                 "AwbEnable": False,
-                "FrameDurationLimits": (int(self.cfg["capture"].get("snap_exposure_us")), int(self.cfg["capture"].get("snap_exposure_us"))),
+                "ExposureTime": 50000,        # 50 ms
+                "AnalogueGain": 4.0,
+                "FrameDurationLimits": (50000, 50000),
                 "ColourGains": [self.cfg["capture"].get("red_gain", 2.0), self.cfg["capture"].get("blue_gain", 1.5)]
             }
         }
 
-        # 3. Merge preset with any dynamic overrides
+        # Merge preset with any dynamic overrides
         controls = {**presets.get(mode, presets["NIGHT"]), **overrides}
         
-        # --- ULTIMATE SAFETY CHECK ---
-        # Ensure FrameDurationLimits perfectly matches ExposureTime if overridden
+        # Ensure FrameDurationLimits matches ExposureTime if overridden
         if mode == "NIGHT" and "ExposureTime" in controls:
             controls["FrameDurationLimits"] = (int(controls["ExposureTime"]), int(controls["ExposureTime"]))
 
         try:
-            if mode != "SNAP":
-                # 4. Synchronize internal state variables if they were changed
-                if "ExposureTime" in controls:
-                    self.current_exposure_us = controls["ExposureTime"]
-                if "AnalogueGain" in controls:
-                    self.current_gain = controls["AnalogueGain"]
+            # Synchronize internal state variables if they were changed
+            if "ExposureTime" in controls:
+                self.current_exposure_us = controls["ExposureTime"]
+            if "AnalogueGain" in controls:
+                self.current_gain = controls["AnalogueGain"]
 
             # Apply to hardware
             self.camera.picam2.set_controls(controls)
@@ -3182,22 +3412,18 @@ class Pipeline:
             applied_gain = controls.get("AnalogueGain", self.current_gain)
 
             # --- THE METADATA FLUSH ---
-            if mode == "DAY":
+            if mode in ("DAY"):
                 self.camera.flush() # Uses the fallback 4-frame loop
                 logging.info("Preset: Mode DAY applied. (Auto-Exposure Unlocked)")
             else:
-                # Wait for the physical exposure time to finish integrating light
-                settle_time = (applied_exp_us / 1000000.0) + 0.1 
-                time.sleep(settle_time)
-                
-                # Tell the flush method exactly what Exposure to look for. 
-                self.camera.flush(target_exposure_us=applied_exp_us, target_gain=applied_gain)
+                # We let flush() natively block and return the synced frame.
+                synced_frame = self.camera.flush(target_exposure_us=applied_exp_us, target_gain=applied_gain)
                 logging.info(f"Preset: Mode {mode} applied. (Exp: {applied_exp_us}us, Gain: {applied_gain:.2f})")
+                return True, synced_frame
 
-            return True
         except Exception as e:
             logging.error(f"Preset: Failed to apply preset {mode}: {e}")
-            return False
+            return False, None
     # -----------------
     def _load_calibration_frames(self):
         """
@@ -3206,27 +3432,27 @@ class Pipeline:
         """
         cfg = self.cfg["detection"]
         
-        # 1. Load Master Dark (Standard subtraction)
+        # Load Master Dark (Standard subtraction)
         if cfg["dark_frame_path"] and os.path.exists(cfg["dark_frame_path"]):
             self.master_dark = cv2.imread(cfg["dark_frame_path"], cv2.IMREAD_UNCHANGED)
             logging.info(f"Loaded Master Dark: {cfg['dark_frame_path']}")
         else:
             self.master_dark = None
 
-        # 2. Load Bias (Needed to calibrate the Flat)
+        # Load Bias (Needed to calibrate the Flat)
         bias_frame = None
         if cfg["bias_frame_path"] and os.path.exists(cfg["bias_frame_path"]):
             bias_frame = cv2.imread(cfg["bias_frame_path"], cv2.IMREAD_UNCHANGED).astype(np.float32)
             logging.info(f"Loaded Master Bias: {cfg['bias_frame_path']}")
 
-        # 3. Load and Process Flat Frame
+        # Load and Process Flat Frame
         self.flat_multiplier = None
         if cfg["flat_frame_path"] and os.path.exists(cfg["flat_frame_path"]):
             try:
                 raw_flat = cv2.imread(cfg["flat_frame_path"], cv2.IMREAD_UNCHANGED).astype(np.float32)
                 logging.info(f"Loaded Master Flat: {cfg['flat_frame_path']}")
 
-                # A. Subtract Bias from Flat (Crucial for mathematical accuracy)
+                # Subtract Bias from Flat (Crucial for mathematical accuracy)
                 if bias_frame is not None:
                     # Ensure dimensions match
                     if raw_flat.shape == bias_frame.shape:
@@ -3236,7 +3462,7 @@ class Pipeline:
                     else:
                         logging.warning("Bias and Flat dimensions mismatch! Skipping Bias subtraction on Flat.")
 
-                # B. Normalize: GainMap = Mean / PixelValue
+                # Normalize: GainMap = Mean / PixelValue
                 # This creates a map where dark corners have values > 1.0 (to boost brightness)
                 # and bright centers have values < 1.0
                 
@@ -3303,14 +3529,14 @@ class Pipeline:
         recent_frames = deque(maxlen=buffer_frames)
         
         # --- State Management for creating two different packages ---
-
         current_event_video_frames = []
         current_event_stack_frames = []
         event_cooldown_counter = 0
 
         # Forcibly end any event that lasts longer than this many frames to prevent memory leaks.
         # A real meteor will never last this long.
-        max_event_frames = self.cfg["detection"].get("max_event_frames", 300)
+        # max_event_frames = self.cfg["detection"].get("max_event_frames", 300)
+        max_event_frames = self.effective_max_event_frames
         
         current_event_frame_count = 0
         
@@ -3321,10 +3547,10 @@ class Pipeline:
             # Wait for the sky monitor to complete its first check.
             if not self.capture_stable.is_set():
                 try:
-                    # 1. Drain the Acquisition Queue (Filled by CaptureThread)
+                    # Drain the Acquisition Queue (Filled by CaptureThread)
                     self.acq_q.get(timeout=1.0)
                     
-                    # 2. Drain the Stale Timelapse Queue (Stale frames from before the check)
+                    # Drain the Stale Timelapse Queue (Stale frames from before the check)
                     while not self.timelapse_q.empty():
                         try:
                             self.timelapse_q.get_nowait()
@@ -3352,11 +3578,11 @@ class Pipeline:
                 logging.info(f"Updating pre-event buffer from {recent_frames.maxlen} to {new_buffer_size} frames.")
                 recent_frames = deque(list(recent_frames), maxlen=new_buffer_size)
 
-            # 1. Dark Subtraction (Integer Math - Fast)
+            # Dark Subtraction (Integer Math - Fast)
             if self.master_dark is not None:
                 frame = cv2.subtract(frame, self.master_dark.astype(np.uint16))
 
-            # 2. Flat Field Correction (Float Math - Slower but necessary)
+            # Flat Field Correction (Float Math - Slower but necessary)
             if self.flat_multiplier is not None:
                 try:
                     # Convert to float, multiply by gain map, clip, convert back
@@ -3366,7 +3592,7 @@ class Pipeline:
                 except Exception:
                     pass # Fallback to uncorrected if dimension mismatch occurs
 
-            # 3. Calibration Queue
+            # Calibration Queue
             if self.is_calibrating.is_set():
                 try:
                     self.calibration_q.put_nowait((ts, frame.copy()))
@@ -3390,12 +3616,11 @@ class Pipeline:
             # --- DEBUG REPORTING ---
             debug_level = self.cfg["general"].get("debug_level", 0)
 
-            # 2. Now, check if we should even attempt the meteor hunt. 
-                        
+            # Now, check if we should even attempt the meteor hunt. 
             if self.daylight_mode_active.is_set() or self.weather_hold_active.is_set():
                 threshold_label = "N/A (Paused)"
                 
-                # --- NEW: Smart Auto-Throttling (Day/Hold) ---
+                # --- Smart Auto-Throttling (Day/Hold) ---
                 self._enqueue_timelapse_frame(ts, frame, threshold_label)
 
                 if debug_level >= 1:
@@ -3406,7 +3631,12 @@ class Pipeline:
 
             # --- Detection Logic ---
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (5,5), 0)
+            
+            # DYNAMIC BLUR: Scale blur size relative to image resolution
+            blur_size = max(3, int(self.cfg["capture"]["width"] / 250))
+            if blur_size % 2 == 0: blur_size += 1  # Must be odd
+            
+            gray = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
 
             current_alpha = self._get_dynamic_accumulate_alpha()
             # If SkyMonitor sets self.background = None mid-loop, 'local_bg' keeps the image object alive.
@@ -3415,7 +3645,6 @@ class Pipeline:
             if local_bg is None:
                 # Initialize both local and shared state
                 self.background = gray.astype("float32")
-                #recent_frames.append((ts, frame.copy(), effective_threshold))
                 continue
          
             # Cooldown after background reset (prevents false events)
@@ -3441,7 +3670,10 @@ class Pipeline:
             _, th = cv2.threshold(diff, thr16, 255, cv2.THRESH_BINARY)
             th = th.astype(np.uint8)
 
-            th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
+            # DYNAMIC MORPHOLOGY: Scale the gap-closing kernel for meteor tails
+            morph_size = max(3, int(self.cfg["capture"]["width"] / 400))
+            morph_kernel = np.ones((morph_size, morph_size), np.uint8)
+            th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, morph_kernel)
                        
             # Finds the contours and creates the 'cnts' variable.
             cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -3454,8 +3686,6 @@ class Pipeline:
                 area = cv2.contourArea(c) 
                 if area < self.min_area:
                     rejection_stats["area"] += 1
-#                    with self.status_lock:
-#                        self.session_stats["rejected_contours"] += 1
                 else:
                     accepted_cnts += 1
             
@@ -3515,7 +3745,12 @@ class Pipeline:
             recent_frames.append((ts, frame.copy(), effective_threshold))
            
             if detected:
-                if not self.event_in_progress.is_set():
+                # --- NEW: OOM RAM PROTECTION ---
+                if self.memory_critical.is_set() and not self.event_in_progress.is_set():
+                    # Skip starting a new event to save memory. 
+                    # The frame is still sent to timelapse above, so star trails aren't lost!
+                    pass
+                elif not self.event_in_progress.is_set():
                     # --- EVENT START ---
                     logging.info("New event started at %s (contours=%d)", ts, len(cnts))
                     self.event_in_progress.set()
@@ -3536,8 +3771,6 @@ class Pipeline:
                     current_event_frame_count += 1
                 
                 event_cooldown_counter = 0 # Reset cooldown on new detection
-#                with self.status_lock:
-#                    self.session_stats["total_events"] += raw_contour_count
             
             elif self.event_in_progress.is_set():
                 # --- EVENT COOLDOWN ---
@@ -3549,7 +3782,11 @@ class Pipeline:
 #            logging.info(f"ecc {event_cooldown_counter} su {cooldown_frames} - cef {current_event_frame_count} su {max_event_frames}")
             if self.event_in_progress.is_set() and (event_cooldown_counter > cooldown_frames or current_event_frame_count >= max_event_frames):
 
-                if current_event_frame_count >= max_event_frames:
+                if self.memory_critical.is_set():
+                    # --- OOM EVENT ABORT ---
+                    logging.error(f"EVENT FORCIBLY TERMINATED: RAM usage critical. Halting event early after {current_event_frame_count} frames to save memory.")
+                    self.log_health_event("WARNING", "EVENT_TRUNCATED", "RAM Critical. Event cut short.")
+                elif current_event_frame_count >= max_event_frames:
                     # --- EVENT END ---
                     logging.error(f"EVENT TIMEOUT: Event forcibly terminated after {current_event_frame_count} frames to prevent memory leak.")
                     self.log_health_event("ERROR", "EVENT_TIMEOUT", f"Forced event termination after {current_event_frame_count} frames.")
@@ -3603,20 +3840,9 @@ class Pipeline:
                         self.event_log_q.put_nowait(log_summary)
                   
                 except queue.Full:
-                    logging.warning("An event queue was full. Data for this event was dropped.")
-
-                # # --- Celestial Accumulation Map ---
-                # event_max_projection = np.max([f for (_, f, _) in current_event_stack_frames], axis=0).astype(np.uint8)
-                
-                # if self.nightly_masterpiece is None:
-                    # self.nightly_masterpiece = event_max_projection
-                # else:
-                    # # Keep the brightest pixels from either the masterpiece or the new event
-                    # self.nightly_masterpiece = cv2.max(self.nightly_masterpiece, event_max_projection)
-                
-                # # Save the masterpiece to disk so it survives a crash
-                # cv2.imwrite(os.path.join(self.daylight_out_dir, "nightly_masterpiece_live.jpg"), self.nightly_masterpiece)
-                
+                    logging.warning("🚨 Event queue is FULL! Data for this event was dropped to protect system memory from OOM.")
+                    self.log_health_event("WARNING", "QUEUE_FULL", "Event dropped to protect RAM.")
+                    
                 # Reset state for the next event.
                 self.event_in_progress.clear()
                 current_event_video_frames = []
@@ -3631,13 +3857,13 @@ class Pipeline:
         while self.running.is_set():
             check_min = self.cfg["daylight"].get("check_interval_min")
       
-            # 1. Only perform a check if the main capture thread is currently active.
+            # Only perform a check if the main capture thread is currently active.
             if self.producer_thread_active():
                 sky_state_changed = False
                 
                 logging.info("Sky Monitor: Routine check starting. Pausing data acquisition.")
                 self.capture_stable.clear()
-                # A. Check for daylight to determine the primary operating mode.
+                # Check for daylight to determine the primary operating mode.
                 self.update_operating_mode()
       
                 # Only strictly synchronize if in Night Mode. 
@@ -3646,7 +3872,7 @@ class Pipeline:
                     if not self.wait_for_safe_window():
                         continue
 
-                # B. If we are in Night Mode, also check for clouds.
+                # If we are in Night Mode, also check for clouds.
                 if not self.daylight_mode_active.is_set():
                     if self.cfg["capture"].get("auto_exposure_tuning"):
                         self.perform_auto_exposure()
@@ -3656,14 +3882,12 @@ class Pipeline:
                     
                     sky_state_changed = False
                     # Sky condition change
-                    # if status != SkyConditionStatus.ERROR and status != self.last_sky_status:
                     if status != self.last_sky_status:
                         logging.info(f"Sky Monitor: Sky state changed from {self.last_sky_status} to {status}")
                         sky_state_changed = True
                         self.last_sky_status = status
 
                     # Day / Night mode change
-                    # current_daylight_mode = self.daylight_mode_active.is_set()
                     if self.daylight_mode_active.is_set() != self.last_daylight_mode:
                         logging.info(f"Sky Monitor: Daylight mode changed from {self.last_daylight_mode} to {self.daylight_mode_active.is_set()}"
                         )
@@ -3689,7 +3913,6 @@ class Pipeline:
                             self.last_effective_threshold = f"{self.threshold_max} (FAILSAFE)"
                             
                 # Reset the background model to prevent false triggers.
-                                                                                  
                 if sky_state_changed:
                     logging.info("Sky Monitor: Background reset due to state change.")
                     self.background = None
@@ -3700,7 +3923,7 @@ class Pipeline:
                     logging.info("Sky Monitor: Initial check complete. Releasing detection thread.")
                     self.capture_stable.set()
             
-            # 3. Wait for the next full interval before checking again.
+            # Wait for the next full interval before checking again.
             logging.info("Sky Monitor: Next check in %d minutes or upon request.", check_min)
             for _ in range(check_min * 60):
                 if not self.running.is_set(): break # Allow for fast shutdown
@@ -3725,18 +3948,25 @@ class Pipeline:
 
         with self.camera_lock:        
             try:     
-                snap_exposure_us = self.cfg["capture"].get("snap_exposure_us")
-                snap_gain = self.cfg["capture"].get("snap_gain")
-                # Auto-exposure limits shutter speed based on framerate (usually 33ms).
-                # This is too dark for star analysis. We force snap_exposure_us.
-                logging.info(f"Snapshot Mode: NIGHT (Manual Long Exposure {snap_exposure_us:.1f}us)")
-                self._set_camera_preset("SNAP")
-                # Wait for exposure + readout (10s exposure needs >10s wait)
-                # wait_time = (snap_exposure_us / 1000000.0) + 1.0
-                # logging.info(f"Waiting {wait_time:.1f}s for long exposure integration...")
-                # time.sleep(wait_time)
+                # Auto-exposure just ran and dialed the camera perfectly to target brightness.
+                # We simply take one frame at the current perfect settings.
+                logging.info(f"Snapshot Mode: Current NIGHT Settings (Exp {self.current_exposure_us/1000000:.1f}s, Gain {self.current_gain:.2f})")
 
-                frame = self.camera.read()
+                # --- FIX: ZERO-LATENCY HANDOFF ROUTING ---
+                frame = getattr(self, "snapshot_frame", None)
+                
+                if frame is not None:
+                    logging.info("Snapshot: Using exposed frame from Auto-Exposure handoff.")
+                    self.snapshot_frame = None  # Consume the frame so it isn't reused later
+                else:
+                    # If auto-exposure didn't run, check if we can safely use the RAM frame
+                    if getattr(self, "use_ram_for_check", False) and getattr(self, "last_raw_frame", None) is not None:
+                        logging.info("Snapshot: Using recent RAM frame (Zero latency).")
+                        frame = self.last_raw_frame
+                    else:
+                        logging.info("Snapshot: Acquiring fresh hardware frame.")
+                        frame = self.camera.read()
+
                 if frame is None:
                     # Register the failure globally!
                     self._register_camera_failure()
@@ -3768,17 +3998,17 @@ class Pipeline:
                 
                 self.session_stats["max_moon_impact"] = max(self.session_stats["max_moon_impact"], moon_impact)
                 moon_penalty = 0.0 
-                # === Adaptive threshold update (REFACTORED) ===
+                # === Adaptive threshold update ===
                 if self.cfg["detection"]["auto_sensitivity_tuning"]:
                     current_stddev = float(results["stddev"])
                     
-                    # 1. Update Noise Baseline (EMA)
+                    # Update Noise Baseline (EMA)
                     if self.noise_baseline_stddev is None:
                         self.noise_baseline_stddev = current_stddev
                     else:
                         self.noise_baseline_stddev = ((1 - self.cfg["detection"].get("noise_smoothing_alpha")) * self.noise_baseline_stddev) + (self.cfg["detection"].get("noise_smoothing_alpha") * current_stddev)
 
-                    # 2. Calculate the Target Threshold (Noise + Moon)
+                    # Calculate the Target Threshold (Noise + Moon)
                     base_thr = self.cfg["detection"]["base_threshold"]
                     noise_factor = self.cfg["detection"]["noise_factor"]
                     moon_penalty = self.compute_moon_penalty(moon_impact=moon_impact, moon_alt=moon_alt, moon_in_fov=moon_in_fov)
@@ -3786,7 +4016,7 @@ class Pipeline:
                     # This is what the system *wants* the threshold to be
                     target_threshold = int(base_thr + (self.noise_baseline_stddev * noise_factor) + moon_penalty)
 
-                    # 3. Apply Smoothing (Limit change to ±20% of current value)
+                    # Apply Smoothing (Limit change to ±20% of current value)
                     if self.effective_threshold is None:
                         # First run initialization
                         self.effective_threshold = target_threshold
@@ -3799,10 +4029,10 @@ class Pipeline:
                         elif target_threshold < self.effective_threshold:
                             self.effective_threshold = max(self.effective_threshold - max_delta, target_threshold)
 
-                    # 4. Final Clamp (Absolute safety limits)
+                    # Final Clamp (Absolute safety limits)
                     self.effective_threshold = max(self.threshold_min, min(self.threshold_max, self.effective_threshold))
                     
-                    # 5. Update status for Dashboard/ZMQ
+                    # Update status for Dashboard/ZMQ
                     with self.status_lock:
                         # self.last_sky_conditions = results
                         self.last_moon_info = f"{int(moon_impact*100)}% (In FOV: {moon_in_fov})"
@@ -3818,18 +4048,18 @@ class Pipeline:
                         self.last_effective_threshold = self.effective_threshold
                         
                     self.last_moon_info = f"{int(moon_impact*100)}% (In FOV: {moon_in_fov})"
-                    
-                meta = self.get_metadata(n_frames=1, override_exposure=snap_exposure_us, override_gain=snap_gain)
+
+                meta = self.get_metadata(n_frames=1)
                 meta.update(results)
                 self.save_json_atomic(os.path.splitext(full_path)[0] + ".json", meta)
                 logging.info("Saved daylight snapshot and analysis to %s", full_path)
 
-                # 1. Get Base Config Limits
+                # Get Base Config Limits
                 cfg_day = self.cfg["daylight"]
                 limit_std = cfg_day["stddev_threshold"]
                 limit_stars = cfg_day["min_stars"]
 
-                # 2. Apply Lunar Relaxation
+                # Apply Lunar Relaxation
                 # If the moon is IN FOV, it creates massive contrast (high stddev).
                 # We must relax the limit, otherwise the moon itself makes the system think it's "Cloudy".
                 if moon_in_fov:
@@ -3838,14 +4068,13 @@ class Pipeline:
                     effective_std_limit = limit_std * 2.5
                     effective_star_limit = max(3, int(limit_stars * 0.4))
                     self.session_stats["moon_visible_minutes"] += elapsed_minutes
-                    # TODO change the value of std_dev and star also in the dashboard
                     logging.info(f"Sky Check: Moon IN FOV. Relaxing limits -> MaxStd: {effective_std_limit:.1f}, MinStars: {effective_star_limit}")
                 else:
                     # Normal Dark Sky
                     effective_std_limit = limit_std
                     effective_star_limit = limit_stars
 
-                # 3. Perform the Check
+                # Perform the Check
                 score = self.compute_sky_score(
                     raw_stddev=results["stddev"],
                     norm_stddev=results["norm_stddev"],
@@ -3855,15 +4084,9 @@ class Pipeline:
                     star_limit=effective_star_limit
                 )
                 
-                # | Score     | Stato              |
-                # | --------- | ------------------ |
-                # | ≥ 1.3     | Sereno ottimo      |
-                # | 1.0 – 1.3 | Sereno accettabile |
-                # | 0.8 – 1.0 | Borderline         |
-                # | < 0.8     | Cloudy             |
                 self.session_stats["avg_sky_score"].append(score)
                 self.sky_score = score
-                is_clear = score >= 0.8   # normally it was 1
+                is_clear = score >= SKY_SCORE_VALUES["fair"]    # fair start at 0.8, from 0.1 to < 0.8 is cloudy.
                 
                 self.session_stats["sky_history"].append({
                     "t": time.time(), "score": round(score, 3),
@@ -3898,8 +4121,6 @@ class Pipeline:
           
             except Exception as e:
                 logging.exception("An error occurred during daylight snapshot: %s", e)
-                # logging.exception("Diagnostics error: %s", e)
-                # Ensure even on error, last_moon_status doesn't disappear from memory
                 self.session_stats["error_mins"] += elapsed_minutes
                 with self.status_lock:
                      # Informative dashboard message
@@ -3908,7 +4129,6 @@ class Pipeline:
             
             finally:
                 self.session_stats["last_check_time"] = now_ts
-                self._set_camera_preset("NIGHT")
                 logging.info("Restored night capture settings.")
     # -----------------
     def analyze_sky_conditions(self, img):
@@ -3916,40 +4136,49 @@ class Pipeline:
         Analyzes the image to determine sky clarity.
         Improved to filter out sensor noise and cloud textures.
         """
-        # 1. Get robust stats and the ROI image directly from the helper
+        # Get robust stats and the ROI image directly from the helper
         roi_mean, norm_stddev, raw_stddev, _, roi_img, _, _ = self._compute_roi_stats(img, blur=False)
          
-        # --- STEP 2: Top-Hat Transform ---
-        # Kernel size 15 is good for stars. 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        # --- Top-Hat Transform ---
+        # DYNAMIC KERNEL: Scale the background extractor based on the resolution tuning profile
+        base_k = self.star_mask_radius * 3
+        k_size = int(base_k) if int(base_k) % 2 != 0 else int(base_k) + 1 # Must be odd
+        k_size = max(15, k_size) # Absolute minimum of 15 for low-res safety
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
         tophat = cv2.morphologyEx(roi_img, cv2.MORPH_TOPHAT, kernel)
         
-        # --- STEP 3: Thresholding ---
-        # th_mean, th_stddev = cv2.meanStdDev(tophat)
+        # --- Thresholding ---
         th_mean, _ = cv2.meanStdDev(tophat)
         
 
         # We ensure the threshold is at least 15 to avoid counting black-level noise.
         thresh_val = th_mean[0][0] + (3.0 * raw_stddev)
         
-        # _, thresh_img = cv2.threshold(tophat, thresh_val, 255, cv2.THRESH_BINARY)
         _, thresh_img = cv2.threshold(tophat.astype(np.float32), thresh_val, 255, cv2.THRESH_BINARY)
         thresh_img = thresh_img.astype(np.uint8)
 
         # Remove isolated speckles after threshold
-        clean_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # DYNAMIC CLEANUP: Scale the speckle remover
+        clean_size = max(3, int(self.star_mask_radius * 0.5))
+        if clean_size % 2 == 0: clean_size += 1
+        clean_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (clean_size, clean_size))
         thresh_img = cv2.morphologyEx(thresh_img, cv2.MORPH_OPEN, clean_kernel)
 
-        # --- STEP 4: Contour Analysis with Shape Filtering ---
+        # --- Contour Analysis with Shape Filtering ---
         cnts, _ = cv2.findContours(thresh_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         star_count = 0
+        # DYNAMIC AREA LIMITS: Calculate physics based on the tuned radius
+        max_star_area = (self.star_mask_radius * 4) ** 2
+        min_star_area = max(3, int(self.star_mask_radius * 0.5))
+        
         for c in cnts:
             area = cv2.contourArea(c)
             
             # Filter 1: Area. 
             # Increase minimum to 3 to ignore sensor 'hot pixels' or tiny noise speckles.
-            if 3 <= area <= 300:
+            if min_star_area <= area <= max_star_area:
                 # Filter 2: Circularity (4 * pi * Area / Perimeter^2)
                 # Stars are mostly circular (value near 1.0). Noise/Clouds are irregular.
                 perimeter = cv2.arcLength(c, True)
@@ -3975,32 +4204,31 @@ class Pipeline:
         if moon_alt <= 0:
             return 0.0
 
-        # altezza normalizzata (0.2 minimo per evitare zero)
+        # normalized heght (min 0.2 minimo avoid zero)
         alt_factor = max(0.2, min(moon_alt / 60.0, 1.0))
 
-        # scala base
+        # base scale
         scale = moon_scale_in_fov if moon_in_fov else moon_scale_out_fov
 
-        # impatto NON lineare
+        # NON linear impact
         penalty = scale * (moon_impact ** 1.5) * alt_factor
         return penalty
     # -----------------
     def compute_sky_score(self, raw_stddev, norm_stddev, mean_brightness, stars, std_limit, star_limit):
         """
         Hybrid Scoring: Uses Raw limit for dark skies, and Normalized texture check for bright skies.
-        """
-        # --- FAILSAFE: Pure saturation check ---
+        """       
+        # --- Pure saturation check ---
         # If the image is completely blown out (pure white), it has 0 standard deviation, 
         # which tricks the math into thinking it's a perfectly clean dark sky.
         if mean_brightness > 245.0:
             return 0.0
 
-        # 1. Star Score (Linear)
+        # Star Score (Linear)
         star_score = stars / max(star_limit, 1)
 
-        # 2. Noise Score (Hybrid)
-        
-        # A. The Strict Check (Raw)
+        # Noise Score (Hybrid)
+        # The Strict Check (Raw)
         # If Raw Noise is low (e.g. 5.0 vs Limit 10.0), the sky is definitely clear.
         raw_score = std_limit / max(raw_stddev, 0.1)
         
@@ -4040,7 +4268,7 @@ class Pipeline:
         Returns False if shutdown is requested.
         """
 
-        # 1. Wait for meteor event
+        # Wait for meteor event
         if self.event_in_progress.is_set():
             logging.warning("Sky Monitor: Event in progress. Deferring checks.")
             
@@ -4052,7 +4280,7 @@ class Pipeline:
                     
             logging.info("Sky Monitor: Event finished.")
 
-        # 2. Check if Timelapse thread is actually running to avoid unnecessary waiting
+        # Check if Timelapse thread is actually running to avoid unnecessary waiting
         timelapse_alive = any(t.name == "TimelapseThread" and t.is_alive() for t in self.worker_threads)
 
         if not timelapse_alive:
@@ -4081,13 +4309,9 @@ class Pipeline:
     def _compute_roi_stats(self, frame, blur=False, star_candidates=None, radius=5, min_features=3, min_mask_pixels=50, save_debug=None, debug_out_dir=False):
         """
         Centralized ROI authority.
-
         - Computes ROI statistics
         - Defines and enforces central ROI
         - Optionally builds and validates a star mask
-
-        Returns:
-            mean, stddev, gray, roi, borders, roi_meta
         """
         
         # Convert to grayscale if needed
@@ -4101,14 +4325,18 @@ class Pipeline:
             gray = cv2.GaussianBlur(gray, (5,5), 0)
             
         h, w = gray.shape
+
+        # ADJUST THIS VARIABLE TO CHANGE ROI SIZE
+        roi_percent = self.cfg["timelapse"].get("roi_percent")  # 0.7
         
         # Calculate offsets
-        border_h = h // 4
-        border_w = w // 4
-        
-        # ROI: Central 50% (cut top/bottom/left/right 25%)
-#        roi = gray[h//4 : h*3//4, w//4 : w*3//4]
-        roi = gray[border_h : h - border_h, border_w : w - border_w]
+        margin_h = (1.0 - roi_percent) / 2
+        margin_w = (1.0 - roi_percent) / 2
+
+        y_start, y_end = int(h * margin_h), int(h * (1.0 - margin_h))
+        x_start, x_end = int(w * margin_w), int(w * (1.0 - margin_w))
+
+        roi = gray[y_start : y_end, x_start : x_end]
         mean, stddev = cv2.meanStdDev(roi)
         
         mean_val = float(mean[0][0])
@@ -4117,8 +4345,7 @@ class Pipeline:
         # Normalizza lo stddev per il livello medio
         norm_stddev = stddev_val / max(mean_val, 1.0)
 
-        # roi_meta = {"stddev": float(stddev[0][0]), "stars_center": 0, "mask": None, "valid": False}
-        roi_meta = {"stddev": stddev_val / 256.0, "norm_stddev": norm_stddev, "stars_center": 0, "mask": None, "valid": False}
+        roi_meta = {"stddev": stddev_val / 256.0, "norm_stddev": norm_stddev, "anchor_points": 0, "mask": None, "valid": False}
 
         # --- Optional mask construction ---
         if star_candidates:
@@ -4132,18 +4359,18 @@ class Pipeline:
             mask = cv2.dilate(mask, kernel, iterations=1)
 
             # Enforce ROI
-            mask[:border_h, :] = 0
-            mask[h - border_h :, :] = 0
-            mask[:, :border_w] = 0
-            mask[:, w - border_w :] = 0
+            mask[:y_start, :] = 0
+            mask[y_end :, :] = 0
+            mask[:, :x_start] = 0
+            mask[:, x_end :] = 0
 
-            # Count stars inside ROI
-            stars_in_center = sum(
+            # Count anchors inside ROI
+            anchors_in_center = sum(
                 1 for cx, cy, _ in star_candidates
-                if border_w < cx < w - border_w and border_h < cy < h - border_h
+                if x_start < cx < x_end and y_start < cy < y_end
             )
 
-            roi_meta.update({"stars_center": stars_in_center, "mask": mask, "valid": (cv2.countNonZero(mask) >= min_mask_pixels and stars_in_center >= min_features)})
+            roi_meta.update({"anchor_points": anchors_in_center, "mask": mask, "valid": (cv2.countNonZero(mask) >= min_mask_pixels and anchors_in_center >= min_features)})
 
         # --- Debug visualization ---
         if save_debug and debug_out_dir:
@@ -4151,18 +4378,12 @@ class Pipeline:
                 debug_vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
                 # ROI rectangle
-                cv2.rectangle(
-                    debug_vis,
-                    (border_w, border_h),
-                    (w - border_w, h - border_h),
-                    (255, 0, 0),
-                    2
-                )
+                cv2.rectangle(debug_vis, (x_start, y_start), (x_end, y_end), (255, 255, 0), 2)
 
                 # Stars
                 for cx, cy, _ in star_candidates:
                     center = (int(cx), int(cy))
-                    if border_w < cx < w - border_w and border_h < cy < h - border_h:
+                    if x_start < cx < x_end and y_start < cy < y_end:
                         cv2.circle(debug_vis, center, 5, (0, 255, 0), 1)
                     else:
                         cv2.circle(debug_vis, center, 3, (0, 0, 255), 1)
@@ -4176,8 +4397,7 @@ class Pipeline:
             except Exception as e:
                 logging.error(f"Failed to save ROI debug visualization: {e}")
 
-        # return mean[0][0], stddev[0][0], gray, roi, (border_h, border_w), roi_meta
-        return mean_val, norm_stddev, stddev_val, gray, roi, (border_h, border_w), roi_meta
+        return mean_val, norm_stddev, stddev_val, gray, roi, (y_start, x_start), roi_meta
     # -----------------
     def stack_frames(self, frames, align=True, method="mean", min_features_for_alignment=3, is_event_stack=False):
         """
@@ -4200,24 +4420,17 @@ class Pipeline:
         if debug_level == 2:   
             timestamp = datetime.now().strftime("%H%M%S")
             stack_type = "event" if is_event_stack else "timelapse"
-            # stack_dump_dir = os.path.join(self.general_log_dir, "debug_dumps", f"stack_{self.debug_stack_counter}_{stack_type}_{timestamp}")
             stack_dump_dir = os.path.join(self.general_log_dir, "debug_dumps", f"stack_{stack_type}_{timestamp}")     
             os.makedirs(stack_dump_dir, exist_ok=True)
-            # self.debug_stack_counter += 1
         
         try:
             # Basic frame parameters
             h, w = frames[0].shape[:2]
-            # feature_count = 0
             stars_used = 0
-            # first_frame_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
             half_stack = len(frames) // 2
             first_frame_gray = cv2.cvtColor(frames[half_stack], cv2.COLOR_BGR2GRAY)
-                    
-#            mean_brightness = np.mean(first_frame_gray)
             
             if debug_level >= 2:
-#                dump_root  = os.path.join(self.general_log_dir, "debug_dumps")
                 debug_mode = True
             else:
                 debug_mode = False
@@ -4231,7 +4444,6 @@ class Pipeline:
                     # 0. ROI statistics (central 50%)
                     # -------------------------------------------------
                     mean, _, stddev, gray_img, _, _, _ = self._compute_roi_stats(gray_img, blur=False)  # ok
-                    # border_h, border_w = borders
 
                     # CAN REMOVE...?
                     # Early reject: no texture → no stars
@@ -4295,7 +4507,7 @@ class Pipeline:
                     if not roi_meta["valid"]:
                         return None, {"reason": "early_reject", "stddev": stddev / 256.0}
 
-                    return roi_meta["mask"], {"candidates": len(candidates), "stars_center": roi_meta["stars_center"], "stddev": roi_meta["stddev"]}
+                    return roi_meta["mask"], {"candidates": len(candidates), "anchor_points": roi_meta["anchor_points"], "stddev": roi_meta["stddev"]}
 
                 except Exception as e:
                     logging.error(f"Mask generation error: {e}")
@@ -4492,7 +4704,7 @@ class Pipeline:
             star_mask = None
             bias_mode = False
             bias_reasons = []
-            stars_used = 0
+            anchors_used = 0
 
             if perform_alignment: 
                 
@@ -4511,12 +4723,12 @@ class Pipeline:
                     perform_alignment = False
                     bias_reasons.append("no_star_mask")
                 else:
-                    stars_used = star_meta["stars_center"]
+                    anchors_used = star_meta["anchor_points"]
 
-                    if stars_used < min_features_for_alignment:
+                    if anchors_used < min_features_for_alignment:
                         bias_mode = True
                         perform_alignment = False
-                        bias_reasons.append(f"low_star_count:{stars_used}")
+                        bias_reasons.append(f"low_anchor_count:{anchors_used}")
 
                     elif star_meta.get("stddev", 0) < self.alignment_contrast_floor:    # 2.0 lower if is too strict and with a perfect sky, pass to bias mode
                         bias_mode = True
@@ -4562,30 +4774,35 @@ class Pipeline:
 
 #                if star_mask is None:
 #                    star_meta = {"stddev": 0}
-                logging.info(f"Bias mode: {'ON' if bias_mode else 'OFF'} (stars={stars_used}, std={star_meta.get('stddev',0):.2f})")
+#                logging.info(f"Bias mode: {'ON' if bias_mode else 'OFF'} (anchors={anchors_used}, std={star_meta.get('stddev',0):.2f})")
 
-                if star_mask is None or cv2.countNonZero(star_mask) < 100:
+                # Ensure there is enough physical pixel area for the matrix math to converge
+                # A very conservative estimate is an area of 20 pixels per required star, about 2.5 pixel radius.
+                min_pixel_area = min_features_for_alignment * 20
+
+                if star_mask is None or cv2.countNonZero(star_mask) < min_pixel_area:
                     perform_alignment = False
 
                 self.publish_debug(
                     "stack_bias",{
                         "enabled": bias_mode,
                         "reasons": bias_reasons,
-                        "stars": stars_used,
+                        "anchors": anchors_used,
                         "stddev": star_meta.get("stddev", 0),
                         "frames": len(frames),
                     }
                 )
 
                 if bias_mode:
-                    logging.warning("STACK BIAS MODE ENABLED | reasons=%s | stars=%d | stddev=%.2f | frames=%d", ",".join(bias_reasons), stars_used, star_meta.get("stddev", 0), len(frames))
+                    logging.warning("STACK BIAS MODE ENABLED | reasons=%s | anchors=%d | stddev=%.2f | frames=%d", ",".join(bias_reasons), anchors_used, star_meta.get("stddev", 0), len(frames))
                 else:
-                    logging.info("STACK NORMAL MODE | stars=%d | stddev=%.2f | frames=%d", stars_used, star_meta.get("stddev", 0), len(frames))
-
-                # if not is_event_stack and star_mask is None:
-                    # logging.warning("Timelapse alignment impossible → single-frame fallback.")
-                    # return frames[len(frames)//2], "single_frame_fallback", 0
-                
+                    logging.info("STACK NORMAL MODE | anchors=%d | stddev=%.2f | frames=%d", anchors_used, star_meta.get("stddev", 0), len(frames))
+                    
+                # --- Track Bias Mode over time for the PDF Graph ---
+                with self.status_lock:
+                    if "bias_history" in self.session_stats:
+                        self.session_stats["bias_history"].append({"t": time.time(), "bias": bias_mode})
+               
                 if bias_mode:
                     used_method = "bias mode"
                 else:
@@ -4596,11 +4813,7 @@ class Pipeline:
                 # ----------------------------------------------------------------------
                 cc_values = []
                 weight_values = []
-                consecutive_low_cc = 0          # NEW: drift-detection counter
-                CC_DRIFT_THRESHOLD  = 0.15      # NEW: cc below this is "poor" for drift purposes
-                CC_DRIFT_MAX_COUNT  = 3         # NEW: re-anchor after this many consecutive poor frames
-                # keep a separate prepared ref so we can swap it without touching first_frame_gray
-                current_ref_gray = first_frame_gray.copy()    # NEW
+                
                 # --- Processing Loop ---
                 if effective_method == "mean":
                     accumulator = np.zeros((h, w, 3), dtype=np.float64)
@@ -4629,22 +4842,21 @@ class Pipeline:
                                 gray = cv2.cvtColor(frame_to_add, cv2.COLOR_BGR2GRAY)
                                 
                                 # ECC Config
-                                # warp_mode = cv2.MOTION_EUCLIDEAN
                                 warp_mode = cv2.MOTION_TRANSLATION if bias_mode else cv2.MOTION_EUCLIDEAN
-                                # criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-6)
-                                criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-4)
+                                # criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-4)
+                                # --- This should be good enough ---
+                                # Max 50 iterations, stop when accurate to 0.001 pixels.
+                                criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-3)
+                                # -----
                                 warp_matrix = np.eye(2, 3, dtype=np.float32)
                                 
                                 # Use a Top-Hat transform or a Sharpen filter to isolate stars:
                                 k = max(3, self.star_mask_radius * 2 - 1)   # odd number matching star radius
                                 if k % 2 == 0: k += 1
                                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-                                # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                                ref_prep = cv2.morphologyEx(current_ref_gray, cv2.MORPH_TOPHAT, kernel)
+                                ref_prep = cv2.morphologyEx(first_frame_gray, cv2.MORPH_TOPHAT, kernel)
                                 cur_prep = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)                                
                                 
-                                # ref_ecc = cv2.normalize(ref_prep, None, 0, 255, cv2.NORM_MINMAX)
-                                # cur_ecc = cv2.normalize(cur_prep, None, 0, 255, cv2.NORM_MINMAX)
                                 ref_ecc = cv2.normalize(ref_prep, None, 0, 255, cv2.NORM_MINMAX).astype(np.float32)
                                 cur_ecc = cv2.normalize(cur_prep, None, 0, 255, cv2.NORM_MINMAX).astype(np.float32)
                                 gauss_size = 5 if bias_mode else 3
@@ -4655,7 +4867,7 @@ class Pipeline:
                                 # Norm of (Warp - Identity)
                                 warp_diff = warp_matrix - np.eye(2, 3, dtype=np.float32)
                                 warp_norm = float(np.linalg.norm(warp_diff))
-                                MAX_WARP_PIXELS = min(w, h) * 0.10   # reject if shift > 10% of frame dimension
+                                MAX_WARP_PIXELS = min(w, h) * 0.05   # old 0.10 - reject if shift > 10% of frame dimension
                                 if warp_norm > MAX_WARP_PIXELS:
                                     logging.warning(f"Frame {i}: warp too large ({warp_norm:.1f}px), rejecting.")
                                     should_add = False
@@ -4663,11 +4875,18 @@ class Pipeline:
                                 
                                 alignment_meta.update({"success": True, "cc": float(cc), "warp_norm": warp_norm})
 
-                                cc_ref = 0.05 if bias_mode else 0.10
-                                weight_floor = 0.0 if bias_mode else 0.3
+                                cc_floor = 0.30 if bias_mode else 0.60
+                                cc_perfect = 0.60 if bias_mode else 0.85
                                 
-                                if cc < cc_ref:
-                                    weight = max(weight_floor, cc / cc_ref)
+                                if cc < cc_floor:
+                                    logging.warning(f"Frame {i}: Correlation too low ({cc:.3f}), rejecting.")
+                                    should_add = False
+                                    alignment_meta["error"] = "low_correlation"
+                                    weight = 0.0
+                                elif cc < cc_perfect:
+                                    # Softly reduce the weight of borderline cloudy frames
+                                    weight_floor = 0.2 if bias_mode else 0.4
+                                    weight = weight_floor + (1.0 - weight_floor) * ((cc - cc_floor) / (cc_perfect - cc_floor))
                                 else:
                                     weight = 1.0
 
@@ -4676,32 +4895,11 @@ class Pipeline:
 
                                 cc_values.append(cc)
                                 weight_values.append(weight)
-
-                                # ── NEW: drift detection ────────────────────────────────────
-                                if cc < CC_DRIFT_THRESHOLD  or not should_add:
-                                    consecutive_low_cc += 1
-                                else:
-                                    consecutive_low_cc = 0
-                                    # Good frame: promote it as the new reference so
-                                    # future frames align to the most recent stable sky.
-                                    current_ref_gray = gray.copy()
-
-                                if consecutive_low_cc >= CC_DRIFT_MAX_COUNT:
-                                    # Several frames in a row have drifted badly.
-                                    # Force re-anchor to this frame regardless of its cc,
-                                    # because the old reference is clearly no longer valid.
-                                    logging.warning(
-                                        "Frame %d: %d consecutive low-cc frames detected. "
-                                        "Re-anchoring alignment reference.", i, consecutive_low_cc
-                                    )
-                                    current_ref_gray = gray.copy()
-                                    consecutive_low_cc = 0
-                                # ── end drift detection ──
-                                     
+                                   
                                 if debug_level == 3:
                                     aligned_gray = cv2.cvtColor(frame_to_add, cv2.COLOR_BGR2GRAY)
-                                    diff = cv2.absdiff(current_ref_gray, aligned_gray)
-                                    mosaic = self.create_alignment_mosaic(current_ref_gray, gray, aligned_gray, diff)
+                                    diff = cv2.absdiff(first_frame_gray, aligned_gray)
+                                    mosaic = self.create_alignment_mosaic(first_frame_gray, gray, aligned_gray, diff)
                                     
                                     if mosaic is not None:
                                         # Level 2+: Save to disk if directory is set
@@ -4723,7 +4921,6 @@ class Pipeline:
 
                         if should_add:
                             weight = np.clip(weight, 0.0, 1.0)
-                            # accumulator += frame_to_add.astype(np.float64) * weight
                             
                             # Build per-pixel valid mask: pixels warped off-frame become 0.
                             # Using INTER_NEAREST so the mask is a clean binary 0/1 with
@@ -4756,32 +4953,30 @@ class Pipeline:
                     
                     logging.info(f"STACKED FRAMES: {actual_frames_stacked}/{len(frames)}") 
 
-                    # 1. Normalize to 0.0 - 1.0 range
-                    # final_float = stacked_float / 255.0
                     # Detect bit depth from the actual frame values:
                     max_val = 65535.0 if frames[0].dtype == np.uint16 else 255.0
                     final_float = stacked_float / max_val
                     final_float = np.clip(final_float, 0.0, 1.0).astype(np.float32)
 
                     if self.cfg["timelapse"].get("astro_stretch"):
-                        #final_image = astro_stretch(stacked_float)
                         final_float = astro_stretch(final_float, bias_mode=bias_mode)
                     else:
-                        # final_image = stacked_float.clip(0, 255).astype(np.uint32)
-                        #final_image = np.clip(stacked_float * brightness_boost, 0, 255)
                         final_float = np.clip(final_float * brightness_boost, 0.0, 1.0)
                         
                     if cc_values:
+                        # cc_med: Median Correlation Coefficient is the score OpenCV gives to a frame after trying to align it with the "Master" frame. A score of 1.000 means a 100% perfect, pixel-to-pixel identical match. A score of 0.000 means the images look completely different.
+                        # cc_min: Minimum Correlation Coefficient is the score of the single worst frame in the entire batch.
+                        # weight_mean: Average Blending Weight if a frame has a terrible cc score (like a cloud ruining the shot), the code dynamically drops its weight (opacity) so it doesn't ruin the final stacked image. A weight of 1.0 means the frame is blended at 100% power. A weight of 0.3 means the frame is almost entirely rejected.
                         logging.info("STACK ALIGN STATS | bias=%s | cc_med=%.3f | cc_min=%.3f | weight_mean=%.2f", bias_mode, float(np.median(cc_values)), float(np.min(cc_values)), float(np.mean(weight_values)))
 
                     info = {
-                        "stars": stars_used,
+                        "anchors": anchors_used,
                         "stddev": star_meta.get("stddev", 0),
-                        "bias_reasons": bias_reasons if bias_mode else []
+                        "bias_reasons": bias_reasons if bias_mode else [],
+                        "actual_frames_stacked": actual_frames_stacked
                     }                    
-                    # 4. Convert to UINT16 (0 - 65535) for High Quality Saving
+                    # Convert to UINT16 (0 - 65535) for High Quality Saving
                     final_uint16 = (final_float * 65535).astype(np.uint16)
-                    #return final_image, used_method, info
                     return final_uint16, used_method, info
 
                 else:
@@ -4809,24 +5004,22 @@ class Pipeline:
 
             # Normalize diff for visualization (amplify differences)
             diff_8 = (diff >> 8).astype(np.uint8)
-            # diff_vis = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
             diff_vis = cv2.normalize(diff_8, None, 0, 255, cv2.NORM_MINMAX)
             diff_vis = cv2.applyColorMap(diff_vis, cv2.COLORMAP_JET)
 
             top = np.hstack((prep(ref, "Reference"), prep(inp, "Input")))
             bot = np.hstack((prep(aligned, "Aligned"), prep(diff_vis, "Diff Score")))
             return np.vstack((top, bot))
-            # return (np.vstack((top, bot)) >> 8).astype(np.uint8)
         except Exception:
             return None
     # -----------------
-    def get_moon_state(self):
+    def get_moon_state(self, calc_date=None):
         """Calculates Moon position, phase, and FOV status."""
         try:
             import ephem
             obs = ephem.Observer()
             obs.lat, obs.lon = str(self.cfg["general"]["latitude"]), str(self.cfg["general"]["longitude"])
-            obs.date = datetime.now(timezone.utc)
+            obs.date = calc_date if calc_date is not None else datetime.now(timezone.utc)
             
             moon = ephem.Moon(obs)
             # Get raw radians first for math
@@ -5064,10 +5257,15 @@ class Pipeline:
                 
                 item = self.timelapse_q.get()
 
-                if item is None:
-                    logging.info("Timelapse loop received sentinel.")
+                # --- Handle Shutdown (None) AND Schedule End ("FLUSH") ---
+                if item is None or item == "FLUSH":
+                    if item is None:
+                        logging.info("Timelapse loop received sentinel.")
+                    else:
+                        logging.info("End of schedule reached. Flushing partial timelapse stack...")
+
                     if buffer:
-                        logging.info("Processing final timelapse stack before exiting...")
+                        logging.info(f"Processing partial stack of {len(buffer)} frames before exiting...")
                         frames_to_stack = [f for (_, f, _) in buffer]
                         stacked_image, final_method, stack_info = self.stack_frames(
                             frames_to_stack, 
@@ -5078,13 +5276,27 @@ class Pipeline:
                         )
                         if stacked_image is not None and final_method is not None:
                             tstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                            out_name = f"timelapse_final_{tstamp}.png"
+                            # Name it 'final' if shutting down, or standard if just flushing
+                            out_name = f"timelapse_final_{tstamp}.png" if item is None else f"timelapse_{tstamp}.png"
                             full_path = os.path.join(self.timelapse_out_dir, out_name)
-                            self._safe_save_image(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                            
+                            self._safe_save_image(full_path, stacked_image,[int(cv2.IMWRITE_PNG_COMPRESSION), 3])
                             self._tally_data_write(full_path)
                             self.save_timelapse_metadata(full_path, final_method, buffer, stack_info)
-                    logging.info("Draining complete, exiting.")
-                    break # Exit the loop
+                            
+                            if self.sftp_uploader and self.running.is_set():
+                                logging.info(f"Queueing {os.path.basename(full_path)} and its metadata for upload.")
+                                self.sftp_dispatch_q.put(full_path)
+                                self.sftp_dispatch_q.put(os.path.splitext(full_path)[0] + ".json")
+
+                        buffer.clear()
+                    
+                    if item is None:
+                        logging.info("Draining complete, exiting.")
+                        break # Exit the thread permanently
+                    else:
+                        self.timelapse_complete_event.set()
+                        continue # Keep thread alive for tomorrow night
 
                 buffer.append(item)
             except queue.Empty:
@@ -5141,21 +5353,17 @@ class Pipeline:
     # -----------------
     def _create_timelapse_video(self):
         """
-        Gathers all timelapse images from the last session and encodes them
-        into a single MP4 video file using FFmpeg.
+        Gathers all timelapse images from the last session to generate End-of-Session 
+        summary images (Startrail & Average Stack), and optionally encodes an MP4 video.
         """
-        logging.info("Timelapse video creation thread started.")
+        logging.info("End-of-Session media compilation thread started.")
         # Give other threads a moment to finish writing their last files
         time.sleep(10)
-
-        if not self.cfg["timelapse_video"].get("enabled"):
-            logging.info("Video creation is disabled")
-            return
 
         session_start_ts = self.session_start_time.timestamp()
 
         # 1. Find all timelapse PNGs from the current session
-        image_files = []
+        image_files =[]
         for entry in os.scandir(self.timelapse_out_dir):
             if entry.is_file() and entry.name.startswith("timelapse_") and entry.name.endswith(".png"):
                 try:
@@ -5165,28 +5373,111 @@ class Pipeline:
                     continue # File might have been deleted
 
         if len(image_files) < 2:
-            logging.warning(f"Not enough timelapse images ({len(image_files)}) found for this session to create a video.")
+            logging.warning(f"Not enough timelapse images ({len(image_files)}) found for this session to create media.")
             return
 
         # 2. Sort files chronologically (by filename, which contains the timestamp)
         image_files.sort()
-        logging.info(f"Found {len(image_files)} timelapse images for video creation.")
+        logging.info(f"Found {len(image_files)} timelapse images. Compiling session summaries...")
 
-        # 3. Create a temporary file list for FFmpeg (most reliable method)
+        # --- GENERATE STARTRAIL & AVERAGE STACK ---
+        try:
+            logging.info("Generating Star Trail and Average Stack (this may take a minute)...")
+            
+            base_target = self.cfg["capture"].get("target_sky_brightness", 15)
+            tolerance = self.cfg["capture"].get("tolerance", 2)
+            
+            trail_img = None
+            mean_acc = None
+            valid_count = 0
+            
+            for path in image_files:
+                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    continue
+                    
+                # Average Stack: Accumulate EVERYTHING for extreme noise reduction
+                if mean_acc is None:
+                    mean_acc = img.astype(np.float64)
+                else:
+                    mean_acc += img.astype(np.float64)
+                valid_count += 1
+                
+                # Startrail: Filter anomalies (Headlights, Lightning, Thick Clouds)
+                try:
+                    # Parse timestamp from filename
+                    fname = os.path.basename(path)
+                    t_str = fname.replace("timelapse_", "").replace(".png", "")
+                    dt = datetime.strptime(t_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+                    
+                    # Calculate EXACT historical target for that specific minute
+                    moon_impact, in_fov, _, _ = self.get_moon_state(calc_date=dt)
+                    historical_target = base_target + (15 * moon_impact) if in_fov else base_target
+                    
+                    # Get the actual 8-bit equivalent brightness of the frame
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+                    actual_brightness = float(np.mean(gray)) / 256.0
+                    
+                    # Check against bounds (Give 2x tolerance for natural intra-check drift)
+                    upper_bound = historical_target + (tolerance * 2)
+                    lower_bound = historical_target - (tolerance * 2)
+                    
+                    if lower_bound <= actual_brightness <= upper_bound:
+                        if trail_img is None:
+                            trail_img = img.copy()
+                        else:
+                            trail_img = np.maximum(trail_img, img)
+                    else:
+                        # Frame is rejected from Startrail (but kept in Average Stack)
+                        logging.info(f"Startrail: Rejected {fname} (Bright: {actual_brightness:.1f}, Target: {historical_target:.1f})")
+                        
+                except Exception as e:
+                    # Fallback: if filename parsing fails, include it anyway
+                    if trail_img is None:
+                        trail_img = img.copy()
+                    else:
+                        trail_img = np.maximum(trail_img, img)
+
+            # Finalize and Save
+            if valid_count > 0:
+                mean_img = (mean_acc / valid_count).clip(0, 65535).astype(np.uint16)
+                tstamp = self.session_start_time.strftime("%Y%m%d")
+                
+                avg_path = os.path.join(self.timelapse_out_dir, f"session_avg_{tstamp}.png")
+                self._safe_save_image(avg_path, mean_img,[int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                if self.sftp_uploader and self.running.is_set():
+                    self.sftp_dispatch_q.put(avg_path)
+                
+                if trail_img is not None:
+                    trail_path = os.path.join(self.timelapse_out_dir, f"startrail_{tstamp}.png")
+                    self._safe_save_image(trail_path, trail_img,[int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                    if self.sftp_uploader and self.running.is_set():
+                        self.sftp_dispatch_q.put(trail_path)
+                        
+                logging.info("Successfully generated filtered Star Trail and Session Average images.")
+                    
+        except Exception as e:
+            logging.error(f"Failed to generate session summary images: {e}")
+
+        # --- VIDEO CREATION ---
+        if not self.cfg["timelapse_video"].get("enabled"):
+            logging.info("Video creation is disabled in config. Compilation thread finished.")
+            return
+
+        # Create a temporary file list for FFmpeg (most reliable method)
         filelist_path = os.path.join(self.general_log_dir, "timelapse_filelist.txt")
-        # TODO check to inject the image directly on the ffmpeg
         with open(filelist_path, 'w') as f:
             for path in image_files:
                 # FFmpeg's concat demuxer needs a specific format
                 f.write(f"file '{os.path.abspath(path)}'\n")
 
-        # 4. Construct and run the FFmpeg command
+        # Construct and run the FFmpeg command
         try:
             cfg = self.cfg["timelapse_video"]
             tstamp = self.session_start_time.strftime("%Y%m%d")
             output_path = os.path.join(self.timelapse_out_dir, f"timelapse_video_{tstamp}.mp4")
 
-            ff_cmd = [
+            ff_cmd =[
                 "ffmpeg",
                 "-y",                   # Overwrite output file if it exists
                 "-f", "concat",         # Use the concatenation demuxer
@@ -5200,13 +5491,11 @@ class Pipeline:
             ]
             
             logging.info(f"Encoding end-of-session timelapse video to {os.path.basename(output_path)}...")
-            # subprocess.run(ff_cmd, check=True, capture_output=True, text=True)
             try:
                 subprocess.run(ff_cmd, check=True, capture_output=True, text=True, timeout=600)
             except subprocess.TimeoutExpired:
                 logging.error("Timelapse video creation timed out after 10 minutes. FFmpeg may be frozen.")
                 self.log_health_event("ERROR", "FFMPEG_TIMEOUT", "Timelapse video encoding timed out.")
-            
             
             logging.info(f"Successfully created timelapse video: {os.path.basename(output_path)}")
 
@@ -5222,7 +5511,7 @@ class Pipeline:
         except Exception as e:
             logging.exception("An error occurred during timelapse video creation: %s", e)
         finally:
-            # 5. Clean up the temporary file list
+            # Clean up the temporary file list
             if os.path.exists(filelist_path):
                 os.remove(filelist_path)
     # -----------------
@@ -5238,7 +5527,6 @@ class Pipeline:
         # Calculate brightness from the first frame in the buffer
         first_frame = frames_buffer[0][1]
         gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-        # mean_brightness = np.mean(gray)
         mean_brightness = float(np.mean(gray)) / 256.0
 
         # Calculate the average threshold from all frames in the buffer
@@ -5246,13 +5534,13 @@ class Pipeline:
         avg_threshold = np.mean(thresholds) if thresholds else None
 
         feat_count = stack_info.get("stars", 0) if stack_info else 0
-        # std_dev = stack_info.get("stddev", 0)
-        # stddev_val = std_dev if std_dev != 0 else "N/A"
         stddev_val = stack_info.get("stddev") if stack_info else 0
         bias_list = stack_info.get("bias_reasons", []) if stack_info else []
         
         n_frames = len(frames_buffer)
-        meta = self.get_metadata(n_frames=n_frames, mean_brightness=mean_brightness, effective_threshold=avg_threshold, stddev=stddev_val, bias_reasons=bias_list)
+        image_filename = os.path.basename(img_path)
+        
+        meta = self.get_metadata(n_frames=n_frames, mean_brightness=mean_brightness, effective_threshold=avg_threshold, stddev=stddev_val, bias_reasons=bias_list, stack_info=stack_info, image_filename=image_filename)
         
         meta["sky_status"] = self.last_sky_status.name if self.last_sky_status else "UNKNOWN"
         meta["stack_method"] = method_used 
@@ -5262,23 +5550,27 @@ class Pipeline:
         self.save_json_atomic(json_path, meta)
         logging.info("Saved timelapse metadata to %s", json_path)
     # -----------------
-    def get_metadata(self, n_frames=1, mean_brightness=None, effective_threshold=None, override_exposure=None, override_gain=None, alignment_features=None, stddev=None, bias_reasons=None, stack_info=None, **kwargs):
-        #g = self.cfg["general"]
+    def get_metadata(self, n_frames=1, mean_brightness=None, effective_threshold=None, override_exposure=None, override_gain=None, alignment_features=None, stddev=None, bias_reasons=None, stack_info=None, image_filename=None, **kwargs):
         # Overrides if provided (for snapshots), otherwise use live system state
         exposure_us = override_exposure if override_exposure is not None else self.current_exposure_us
         gain = override_gain if override_gain is not None else self.current_gain     
 
+        actual_stacked = n_frames
+
         if stack_info:
             stddev = stddev if stddev is not None else stack_info.get("stddev")
-            alignment_features = alignment_features if alignment_features is not None else stack_info.get("stars")
+            alignment_features = alignment_features if alignment_features is not None else stack_info.get("anchors")
             bias_reasons = bias_reasons if bias_reasons is not None else stack_info.get("bias_reasons")
+            actual_stacked = stack_info.get("actual_frames_stacked", n_frames)
 
         if mean_brightness:
             lux_val = self.calculate_lux(mean_brightness, exposure_us, gain)
         else:
             lux_val = 0.0
 
-        equivalent_exposure_s = (exposure_us * n_frames) / 1e6
+        # Mathematically adjust the total integration time if frames were rejected
+        equivalent_exposure_s = (exposure_us * actual_stacked) / 1e6
+
         meta = {
             "hostname": self.cfg["general"].get("hostname"),
             "ver": self.cfg["general"].get("version"),
@@ -5286,15 +5578,22 @@ class Pipeline:
             "latitude": self.cfg["general"].get("latitude"),
             "longitude": self.cfg["general"].get("longitude"),
             "timestamp": datetime.now(timezone.utc).isoformat(),
+        }           
+        if image_filename:
+            meta["image_filename"] = image_filename            
+
+        meta.update({           
             "auto_exposure_tuning": self.cfg["capture"].get("auto_exposure_tuning"),
             "exposure_us": exposure_us,
-            "frames_stacked": n_frames,
+            "frames_target": n_frames,      # How many it TRIED to stack
+            "frames_stacked": n_frames,     # How many it ACTUALLY stacked
             "equivalent_exposure_s": equivalent_exposure_s,
             "gain": round(gain, 2),
             "red_gain": self.cfg["capture"].get("red_gain"),
             "blue_gain": self.cfg["capture"].get("blue_gain"),
             "lux": round(lux_val, 5),
-        }
+            "lux_source": getattr(self, "last_light_check_source", "acquired"),
+        })
         if mean_brightness is not None:
             meta["mean_brightness"] = round(mean_brightness, 2)      
 
@@ -5325,7 +5624,8 @@ class Pipeline:
         avg_threshold = np.mean(thresholds) if thresholds else None
 
         n_frames = len(event_frames)
-        meta = self.get_metadata(n_frames=n_frames, mean_brightness=mean_brightness, effective_threshold=avg_threshold, stack_info=stack_info)
+        image_filename = os.path.basename(output_path)
+        meta = self.get_metadata(n_frames=n_frames, mean_brightness=mean_brightness, effective_threshold=avg_threshold, stack_info=stack_info, image_filename=image_filename)
         
         meta["source_event_start_time"] = event_frames[0][0]
         meta["source_event_end_time"] = event_frames[-1][0]
@@ -5431,13 +5731,13 @@ class Pipeline:
                 event_type = health_event['event_type']
                 
                 if event_type in health_stats:
-                    # 1. If event type exists, increment the counter
+                    # If event type exists, increment the counter
                     health_stats[event_type]['count'] += 1
                     # Always update with the latest message and level
                     health_stats[event_type]['last_message'] = health_event['message']
                     health_stats[event_type]['level'] = health_event['level']
                 else:
-                    # 2. If it's a new event type, create a new entry
+                    # If it's a new event type, create a new entry
                     health_stats[event_type] = {
                         "count": 1,
                         "level": health_event['level'],
@@ -5522,7 +5822,7 @@ class Pipeline:
 
         while self.running.is_set():
             try:
-                # 1. Check if we can flush from the disk backlog first.
+                # Check if we can flush from the disk backlog first.
                 upload_q = self.sftp_uploader.upload_q
                 
                 if upload_q.qsize() < upload_q.maxsize and os.path.exists(self.backlog_file_path):
@@ -5547,17 +5847,17 @@ class Pipeline:
                     
                     logging.info(f"SFTP Dispatcher: Flushed {files_flushed} items from disk to memory queue.")
 
-                # 2. Process new items from the main dispatch queue.
+                # Process new items from the main dispatch queue.
                 try:
                     # Use a timeout to allow the loop to re-check the backlog file periodically
                     new_item = self.sftp_dispatch_q.get(timeout=5.0)
                     
-                    # 3. Decide where to put the new item
+                    # Decide where to put the new item
                     if not self.sftp_uploader.upload_q.full():
                         # Rule 1: There's space, enqueue directly.
                         self.sftp_uploader.upload_q.put(new_item)
                     else:
-                        # Rule 2: Queue is full, write to disk backlog.
+                        # Queue is full, write to disk backlog.
                         logging.warning(f"SFTP Dispatcher: Upload queue is full. Writing {os.path.basename(new_item)} to disk backlog.")
                         with open(self.backlog_file_path, 'a') as f:
                             f.write(new_item + '\n')
@@ -5605,11 +5905,11 @@ class Pipeline:
             csv_max_mb = self.cfg.get("janitor", {}).get("csv_rotation_mb", 20)
             csv_backups = self.cfg.get("janitor", {}).get("csv_backup_count", 5)
         
-            # 1. Perform the multi-tiered disk space cleanup.
+            # Perform the multi-tiered disk space cleanup.
             # This function will return False if it fails to free enough space.
             cleanup_successful = self.manage_disk_space(janitor_cfg.get("threshold"), janitor_cfg.get("target"))
 
-            # 2. If cleanup failed, it's a critical error. Stop the entire pipeline.
+            # If cleanup failed, it's a critical error. Stop the entire pipeline.
             if not cleanup_successful:
                 if not self.emergency_stop_active.is_set():
                     logging.critical("!!! JANITOR FAILED TO FREE DISK SPACE. ENTERING EMERGENCY STOP. !!!")
@@ -5619,14 +5919,12 @@ class Pipeline:
                     # self.stop_producer_thread()
                     self.emergency_stop_active.set()
 
-            # 3. If cleanup was successful, perform the data file rotation.
+            # If cleanup was successful, perform the data file rotation.
             self.rotate_data_file(csv_path, max_size_mb=csv_max_mb, backup_count=csv_backups)
             
             logging.info("Janitor run complete. Next check in 1 hour.")
             self.initial_janitor_check_complete.set()
 
-            # if self.running.wait(timeout=3600):
-                # break
             for _ in range(3600):
                 if not self.running.is_set():
                     break
@@ -5641,10 +5939,10 @@ class Pipeline:
         # architettural choice no need to change via config
         delete_priority = ["daylight", "timelapse", "events"]
         try:
-            # 1. Get the path to monitor from the configuration.
+            # Get the path to monitor from the configuration.
             monitor_path = self.cfg["janitor"].get("monitor_path", "/")
             
-            # 2. Use this path for all disk usage checks.
+            # Use this path for all disk usage checks.
             disk = psutil.disk_usage(monitor_path)
             if disk.percent < threshold:
                 return True # Nothing to do, success.
@@ -5652,7 +5950,7 @@ class Pipeline:
             logging.warning(f"Disk usage on '{monitor_path}' is at {disk.percent:.1f}% (threshold is {threshold:.1f}%). Starting prioritized cleanup.")
             self.log_health_event("WARNING", "DISK_USAGE_HIGH", f"Disk at {disk.percent:.1f}%")
             
-            # --- TIER 1: CLEAN UP LEFTOVER EVENT BACKLOGS ---
+            # --- CLEAN UP LEFTOVER EVENT BACKLOGS ---
             event_dir = self.events_out_dir
             backlog_count = 0
             if os.path.isdir(event_dir):
@@ -5675,7 +5973,7 @@ class Pipeline:
                 logging.info("Disk space is now sufficient. Cleanup complete.")
                 return True
 
-            # --- TIER 2: CLEAN UP OLDEST TIMELAPSE FILES ---
+            # --- CLEAN UP OLDEST TIMELAPSE FILES ---
             # Map the config names to the actual directory paths
             dir_map = {
                 "events": self.events_out_dir,
@@ -5683,9 +5981,6 @@ class Pipeline:
                 "daylight": self.daylight_out_dir # Points to the diagnostics subfolder
                 # Add other disposable directories here in the future
             }
-            
-            # Get the deletion order from the config
-            #delete_priority = self.cfg["janitor"].get("priority_delete", ["daylight", "timelapse", "events"])
 
             for tier_name in delete_priority:
                 # Check disk space before starting each tier
@@ -5766,18 +6061,24 @@ class Pipeline:
         # Check for the 'uploaded_at' key.
         return "uploaded_at" in meta
     # -----------------
-    def rotate_data_file(self, file_path, max_size_mb=10, backup_count=5):
-        """Rotates a generic data file (like a CSV) if it exceeds a max size."""
+    def rotate_data_file(self, file_path, max_size_mb=10, backup_count=5, force=False):
+        """Rotates a generic data file (like a CSV) if it exceeds a max size, or if forced."""
         try:
             if not os.path.exists(file_path):
                 return
 
             file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
-            if file_size_mb < max_size_mb:
+            # Skip if not forced and file is smaller than the limit
+            if not force and file_size_mb < max_size_mb:
                 return
 
-            logging.warning("Data file '%s' has reached %.1fMB. Rotating.", os.path.basename(file_path), file_size_mb)
+            # Safely log or print depending on whether the logger is initialized yet
+            msg = f"Rotating file '{os.path.basename(file_path)}' (Forced: {force}, Size: {file_size_mb:.2f}MB)."
+            if logging.getLogger().hasHandlers():
+                logging.info(msg)
+            else:
+                print(msg)
             
             # --- Backup Rotation Logic ---
             # First, shift all existing backups: .4 -> .5, .3 -> .4, etc.
@@ -5795,10 +6096,35 @@ class Pipeline:
             if file_path == self.monitor_out_file:
                  with open(file_path, "w") as f:
                     f.write("timestamp,cpu_temp,cpu_percent,mem_used_mb,mem_percent,"
-                            "disk_used_mb,disk_percent,gpu_percent,load1,load5,load15,uptime_sec\n")
+                            "disk_used_mb,disk_percent,gpu_percent,load1,load5,load15,uptime_sec,core_voltage_v\n")
 
-        except Exception:
-            logging.exception("An error occurred during data file rotation.")
+        except Exception as e:
+            if logging.getLogger().hasHandlers():
+                logging.exception("An error occurred during data file rotation.")
+            else:
+                print(f"Error rotating {file_path}: {e}")
+    # -----------------
+    def _force_rotate_all_logs(self):
+        """Forces the rotation of all main log and CSV files for a clean session."""
+        print("--- FORCED LOG ROTATION TRIGGERED ---")
+        
+        log_backups = self.cfg.get("janitor", {}).get("log_backup_count", 5)
+        csv_backups = self.cfg.get("janitor", {}).get("csv_backup_count", 5)
+        health_backups = self.cfg.get("health_monitor", {}).get("log_backup_count", 3)
+        
+        # List of all critical telemetry files
+        files_to_rotate =[
+            (os.path.join(self.general_log_dir, "pipeline.log"), log_backups),
+            (self.monitor_out_file, csv_backups),
+            (self.event_log_out_file, csv_backups),
+            (self.health_log_out_file, health_backups),
+            (self.camera_k_file, csv_backups)
+        ]
+        
+        for file_path, backups in files_to_rotate:
+            if os.path.exists(file_path):
+                self.rotate_data_file(file_path, max_size_mb=0, backup_count=backups, force=True)
+        print("--- LOG ROTATION COMPLETE ---")
     # -----------------
     # 8. SYSTEM SERVICES (WATCHDOG & POWER)
     # -----------------
@@ -5841,11 +6167,11 @@ class Pipeline:
                 time.sleep(check_interval_sec)
                 continue
             
-            # 1. Ping systemd to let it know the script is responsive.
+            # Ping systemd to let it know the script is responsive.
             if systemd_integration:
                 n.notify("WATCHDOG=1")
 
-            # 2. Check the health of all other threads.
+            # Check the health of all other threads.
             all_monitored_threads = self.worker_threads + self.control_threads
             for thread in all_monitored_threads:
                 if not thread.is_alive():
@@ -5892,8 +6218,6 @@ class Pipeline:
                         logging.info("Maintenance timeout expired, but system is outside of active schedule. Staying idle.")
                 
             # Sleep for a short interval before checking again
-            # if self.running.wait(timeout=5):
-                # break # Exit if shutdown is signaled
             for _ in range(5):
                 if not self.running.is_set(): break
                 time.sleep(1)
@@ -5909,23 +6233,34 @@ class Pipeline:
             interval = self.cfg["monitor"].get("interval_sec", 5)
             ts = datetime.now(timezone.utc).isoformat()
 
-            # temperatura CPU/SoC
+            # CPU/SoC temperature 
             temps = psutil.sensors_temperatures()
             cpu_temp = temps.get("cpu_thermal", [None])[0].current if "cpu_thermal" in temps else 0
             self.session_stats["peak_cpu_temp"] = max(self.session_stats["peak_cpu_temp"], cpu_temp)
 
-            # uso CPU
+            # CPU use
             cpu_percent = psutil.cpu_percent(interval=None)
 
             # memoria
             mem = psutil.virtual_memory()
             mem_used_mb = mem.used / (1024*1024)
+            
+            # --- ACTIVE OOM RAM PROTECTION ---
+            if mem.percent >= 85.0:
+                if not self.memory_critical.is_set():
+                    logging.critical(f"🚨 SYSTEM RAM CRITICAL ({mem.percent:.1f}%) 🚨 - Suspending event recording to prevent OS OOM Kill!")
+                    self.log_health_event("CRITICAL", "OOM_WARNING", f"RAM at {mem.percent:.1f}%. Event capture suspended.")
+                    self.memory_critical.set()
+            elif mem.percent <= 70.0:
+                if self.memory_critical.is_set():
+                    logging.info(f"✅ SYSTEM RAM RECOVERED ({mem.percent:.1f}%) - Resuming normal event recording.")
+                    self.memory_critical.clear()
 
-            # disco
+            # disk
             disk = psutil.disk_usage("/")
             disk_used_mb = disk.used / (1024*1024)
 
-            # GPU usage (se disponibile)
+            # GPU usage
             gpu_percent = 0
             try:
                 gpu_stat = subprocess.check_output(["vcgencmd", "measure_utilisation"], text=True)
@@ -5938,7 +6273,7 @@ class Pipeline:
             # load average
             load1, load5, load15 = os.getloadavg()
 
-            # uptime sistema
+            # system uptime 
             uptime_sec = time.time() - psutil.boot_time()
             
             core_voltage_v = self.get_core_voltage()            
@@ -6019,9 +6354,7 @@ class Pipeline:
                             self.power_status = "SHUTTING DOWN"
                         self.perform_system_action("shutdown", reason=msg)
                         break 
-                
-                # if self.running.wait(timeout=check_interval):
-                    # break
+
                 time.sleep(check_interval)
 
             except Exception:
@@ -6037,17 +6370,8 @@ class Pipeline:
         Crucially, this thread runs INDEPENDENTLY of the main capture schedule
         to signal that the script process is alive at all times.
         """
-#        hb_cfg = self.cfg.get("heartbeat", {})
-
-#        url = hb_cfg.get("url")
-#        active_interval_min = hb_cfg.get("interval_min", 60)
-#        # Use a different, potentially longer interval for when the system is idle
-#        idle_interval_min = self.cfg["general"].get("idle_heartbeat_interval_min", 120) # e.g., 2 hours
         logging.info("Heartbeat monitor started.")
         
-#        if not url:
-#            logging.warning("Heartbeat is enabled, but no valid URL is configured.")
-#            return
         while self.running.is_set():
             hb_cfg = self.cfg.get("heartbeat", {})
             url = hb_cfg.get("url")
@@ -6059,21 +6383,15 @@ class Pipeline:
                 # If disabled or URL missing during a reload, wait and check again.
                 time.sleep(60)
                 continue
-#        try:
-#            import requests
-#        except ImportError:
-#            logging.error("'requests' library is required for the heartbeat feature. Please run 'pip3 install requests'.")
-#            return
 
-#        logging.info(f"Heartbeat monitor started. Will ping every {active_interval_min} min (active) or {idle_interval_min} min (idle).")
             try:
                 import requests
             except ImportError:
                 logging.error("'requests' library is required for the heartbeat feature. Please run 'pip3 install requests'.")
                 return
                 
-#        while self.running.is_set():
-            # 1. Determine the current state and wait interval
+
+            # Determine the current state and wait interval
             is_active = self.producer_thread_active()
             current_interval_sec = (active_interval_min if is_active else idle_interval_min) * 60
             
@@ -6083,7 +6401,7 @@ class Pipeline:
                 time.sleep(1)
             if not self.running.is_set(): break
 
-            # 2. Send the ping
+            # Send the ping
             try:
                 # You can append a status to the URL for services that support it
                 # For Healthchecks.io, the main URL is enough.
@@ -6106,13 +6424,7 @@ class Pipeline:
         Periodically checks the system clock against an NTP server. If significant
         drift is detected, it triggers the OS's own time service to re-synchronize.
         """
-        # ntp_cfg = self.cfg.get("ntp", {})
 
-        # server = ntp_cfg.get("server", "pool.ntp.org")
-        # interval_sec = ntp_cfg.get("sync_interval_hours", 6) * 3600
-        # max_offset = ntp_cfg.get("max_offset_sec", 2.0)
-        
-        # logging.info(f"NTP clock monitor started. Will check against '{server}' every {interval_sec / 3600} hours.")
         logging.info("NTP clock monitor started.")
         time.sleep(60) # Initial delay for network
 
@@ -6175,7 +6487,7 @@ class Pipeline:
         """
         logging.info("Smart configuration reloader thread started.")
 
-        CRITICAL_CAPTURE_PARAMS = ["width", "height", "exposure_us", "gain", "auto_exposure", "red_gain", "blue_gain"]
+        CRITICAL_CAPTURE_PARAMS = ["width", "height", "exposure_us", "gain", "auto_exposure_tuning", "red_gain", "blue_gain"]
         CRITICAL_POWER_PARAMS = ["pin"] # Pin for the power monitor
 
         last_cfg = json.loads(json.dumps(self.cfg)) 
@@ -6210,11 +6522,6 @@ class Pipeline:
                         try:
                             if power_pin_changed:
                                 msg="!!! Power monitor pin changed. A full service restart is required. !!!"
-#                                logging.critical("="*60)
-#                                logging.critical("!!! A CRITICAL PARAMETER HAS CHANGED. !!!")
-#                                logging.critical("!!! A full service restart is required to apply this change safely. !!!")
-#                                logging.critical("!!! The program restart automatically !!!")
-#                                logging.critical("="*60)
                                 self.perform_system_action("exit", reason=msg)
                                 # The code will not proceed past this point.                           
                                                        
@@ -6239,8 +6546,6 @@ class Pipeline:
                                 except Exception:
                                     logging.critical("Failed to re-initialize camera! This is a fatal error.", exc_info=True)
                                     self.perform_system_action("exit", reason="Fatal camera re-initialization failure")
-                                
-                                #self.start_producer_thread()
 
                         finally:
                             # --- RESUME WATCHDOG (CRITICAL) ---
@@ -6278,10 +6583,10 @@ class Pipeline:
             logging.error("Flask library not found. 'pip3 install Flask'. Dashboard disabled.")
             return
 
-        # 1. Read the token from the environment.
+        # Read the token from the environment.
         DASH_TOKEN = os.environ.get("METEORA_DASH_TOKEN")
 
-        # 2. If the token is not set or is empty, refuse to start.
+        # If the token is not set or is empty, refuse to start.
         if not DASH_TOKEN:
             logging.critical("="*60)
             logging.critical("!!! SECURITY ALERT: METEORA_DASH_TOKEN is NOT SET. !!!")
@@ -6311,7 +6616,6 @@ class Pipeline:
             return inner
 
         app = Flask(__name__, static_folder=os.path.abspath("output"))
-#        CORS(app)  # Enable CORS for all routes
         
         # --- PARAMETER ---
         EDITABLE_PARAMS = {
@@ -7155,6 +7459,7 @@ class Pipeline:
                     "emergency_stop": self.emergency_stop_active.is_set(),
                     "maintenance_mode": self.in_maintenance_mode.is_set(),
                     "is_in_schedule": self.within_schedule(),
+                    "memory_critical": self.memory_critical.is_set(),
                     "current_exposure": self.current_exposure_us,
                     "current_gain": self.current_gain,
                     "effective_threshold": self.last_effective_threshold,
@@ -7301,8 +7606,15 @@ class Pipeline:
                     </p>
                 </div>
                 """
-                # When in emergency, we explicitly DISABLE all control buttons.
             else:
+                if status["memory_critical"]:
+                    emergency_message_html += """
+                    <div style="border: 2px solid #e5c07b; background: #3c3c3c; padding: 1.5em; margin: 1em 2em; border-radius: 8px; text-align: center;">
+                        <h3 style="color: #e5c07b; margin: 0 0 0.5em 0;">⚠️ HIGH RAM USAGE DETECTED</h3>
+                        <p style="margin: 0; font-size: 1.1em;">Event detection is temporarily suspended to prevent OS crash.<br>Timelapse and startrails continue normally. Operations will resume when memory drops.</p>
+                    </div>
+                    """
+                # When in emergency, we explicitly DISABLE all control buttons.
                 if status["maintenance_mode"]:
                     buttons_html = f'<a href="/api/resume{token_param}"><button style="background: #98c379;">Resume Normal Operation</button></a>'
 
@@ -7433,10 +7745,10 @@ class Pipeline:
             avg_score = sum(stats["avg_sky_score"]) / len(stats["avg_sky_score"]) if stats["avg_sky_score"] else 0
             
             # Grade Logic
-            if avg_score > 1.3: sky_grade = "EXCELLENT (S+)"
-            elif avg_score > 1.0: sky_grade = "GOOD (A)"
-            elif avg_score > 0.7: sky_grade = "FAIR (B)"
-            else: sky_grade = "POOR (C)"
+            if avg_score > SKY_SCORE_VALUES["excellent"]: sky_grade = "EXCELLENT (S+)"  # > 1.3
+            elif avg_score > SKY_SCORE_VALUES["good"]: sky_grade = "GOOD (A)"           # > 1.0 
+            elif avg_score > SKY_SCORE_VALUES["fair"]: sky_grade = "FAIR (B)"           # > 0.8
+            else: sky_grade = "POOR (C)"                                                # > 0.1
 
             # Efficiency: How many events vs how much noise
             # A high ratio means the detector is perfectly tuned.
@@ -7559,7 +7871,7 @@ class Pipeline:
                     </td>
                 </tr>
                 <tr>
-                    <td>Stars</td>
+                    <td>Sky Check Stars (30m)</td>
                     <td class="{bold}">
                         <span class="{stars_class}">{status['last_sky_stars']}</span> /
                         <span class="{normal_class}">{self.cfg["daylight"]["min_stars"]}</span>
@@ -7991,7 +8303,7 @@ class Pipeline:
             logging.exception(f"Critical error saving image to {filepath}: {e}")
             
         return False
-
+    # -----------------
     def _validate_output_directories(self):
         """Verifies that all required output directories are writable."""
         dirs_to_check = [
@@ -8014,7 +8326,7 @@ class Pipeline:
                     logging.debug(f"Validated directory: {d} is writable.")
             except Exception as e:
                 logging.error(f"Error validating directory {d}: {e}")
-
+    # -----------------
     def _enqueue_timelapse_frame(self, ts, frame, meta_label):
         """
         Helper: Enqueues frames for the timelapse worker.
@@ -8423,6 +8735,7 @@ if __name__ == '__main__':
     parser.add_argument("--bias_frame", action="store_true", help="Capture 50 frames at min exposure for Bias.")
     parser.add_argument("--flat_frame", action="store_true", help="Capture 50 frames (auto-exposed) for Flat.")
     parser.add_argument("--simulate", action="store_true", help="Run in simulation mode with a fake camera feed.")
+    parser.add_argument("--force_rotation", action="store_true", help="Force rotation of all log and CSV files on startup.")
     args = parser.parse_args()
 
     # Helper to capture calibration stacks
@@ -8515,7 +8828,7 @@ if __name__ == '__main__':
     config = Pipeline.load_and_validate_config(args.config)
 
     # 2. Create an instance of the main application class.
-    app = Pipeline(cfg=config, config_path=args.config, simulate=args.simulate)
+    app = Pipeline(cfg=config, config_path=args.config, simulate=args.simulate, force_rotation=args.force_rotation)
 
     # 3. Run the application.
     app.run()
