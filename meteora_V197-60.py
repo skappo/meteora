@@ -121,7 +121,8 @@ DEFAULTS = {
         "max_gain": 12.0,             # The practical maximum before excessive noise  
         "tolerance": 2,
         "max_attempts": 3,
-        "max_brightness": 240
+        "max_brightness": 240,
+        "failure_rate": 0.1
     },
     "detection": {
         "min_area": 50,
@@ -290,6 +291,7 @@ class CaptureConfig(BaseModel):
     tolerance: conint(gt=0,le=10) = DEFAULTS["capture"]["tolerance"]
     max_attempts: conint(gt=0,le=10) = DEFAULTS["capture"]["max_attempts"]
     max_brightness: conint(gt=0,le=240) = DEFAULTS["capture"]["max_brightness"]
+    failure_rate: confloat(ge=0.01, le=1.0) = DEFAULTS["capture"]["failure_rate"]
     @model_validator(mode='after')
     def validate_logical_bounds(self):
         """
@@ -801,7 +803,7 @@ class FrameSimulator:
             "meteor_thickness_max":   5,
             
             # Frame drops
-            "failure_rate": 0.1,  # 0.01 = 1% chance per frame to return None
+            "failure_rate": cfg.get("failure_rate", 0.1),  # 0.01 = 1% chance per frame to return None
         }
 
         self.force_fatal_failure = False # Track if we want to simulate a dead sensor
@@ -2499,8 +2501,10 @@ class Pipeline:
                 if not self.in_maintenance_mode.is_set() and not self.is_calibrating.is_set():
                     logging.info("Scheduler: Outside the schedule time.")
                                
-            # Wait for 60 seconds before the next check.
-            for _ in range(60):
+            # Wait for the next check.
+            # If a camera error is detected, check more frequently (every 5s) to accelerate recovery.
+            wait_sec = 5 if self.camera_fatal_error.is_set() else 60
+            for _ in range(wait_sec):
                 if not self.running.is_set(): break
                 time.sleep(1)
     # -----------------
@@ -6175,6 +6179,12 @@ class Pipeline:
             all_monitored_threads = self.worker_threads + self.control_threads
             for thread in all_monitored_threads:
                 if not thread.is_alive():
+                    # --- CHECK FOR PRODUCER THREAD CRASH ---
+                    # If a producer thread is dead and we have a fatal camera error,
+                    # the Scheduler will handle the restart.
+                    if thread.name in ["CaptureThread", "DetectionThread"] and self.camera_fatal_error.is_set():
+                        continue
+
                     # --- EMERGENCY: A THREAD HAS CRASHED ---
                     msg = f"WATCHDOG: DETECTED CRASHED THREAD: {thread.name}"
 
