@@ -2254,10 +2254,10 @@ class Pipeline:
         self.star_mask_radius = profile["radius"]
         self.alignment_contrast_floor = profile["std_floor"]
         self.effective_max_q = profile["max_q"]
-        self.effective_max_event_frames = profile("max_event_frames")
-        self.effective_max_event_q profile["max_event_q"]
-        self.min_mask_px profile["min_mask_px"]
-        self.ecc_gauss_size profile["ecc_gauss"]
+        self.effective_max_event_frames = profile["max_event_frames"]
+        self.effective_max_event_q = profile["max_event_q"]
+        self.min_mask_px = profile["min_mask_px"]
+        self.ecc_gauss_size = profile["ecc_gauss"]
         self.max_warp_factor = profile["warp_f"]
         self.top_hat_factor = profile["th_f"]  
         
@@ -3399,9 +3399,9 @@ class Pipeline:
                     
                     # Dampen the correction to prevent wild oscillation jumps
                     if correction_ratio > 1.0:
-                        correction_ratio = min(correction_ratio, cfg.get("ae_step_limit_up")    # Max x increase per step
+                        correction_ratio = min(correction_ratio, cfg.get("ae_step_limit_up"))    # Max x increase per step
                     else:
-                        correction_ratio = max(correction_ratio, cfg.get("ae_step_limit_down")  # Max x decrease per step
+                        correction_ratio = max(correction_ratio, cfg.get("ae_step_limit_down"))  # Max x decrease per step
                     
                     # Treat Exposure and Gain as a single pooled product
                     current_product = new_exposure * new_gain
