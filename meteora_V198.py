@@ -16,8 +16,6 @@ Features:
 - rotating logs and safe shutdown
 
 Usage:
-- install dependencies: pip3 install opencv-python-headless numpy psutil pyexiv2
-  (note: on Raspberry Pi prefer opencv built with V4L2 and libcamera; picamera2 optional)
 - There is no hardware H264 or H265 encoder on Pi5. So use software libx264
 - run: python3 meteora_pipeline_pi5.py --config config.yaml
 
@@ -44,6 +42,13 @@ DEBUG
 | `mask radius` | **5** | **10** | **12** | **20** | Stars cover more area; search cone must widen. |
 | `max_event_frames` | **300** | **150** | **100** | **30** | RAM bottleneck. Too many high-res frames crash Python. |
 | `JPEG Quality` | **85** | **75** | **70** | **60** | Balance between clarity and SFTP upload time. |
+
+# 1. Install Astrometry.net and wide-field index files
+sudo apt update
+sudo apt install astrometry.net astrometry-data-tycho2 -y
+
+# 2. Install TFLite Runtime (Lightweight version of TensorFlow)
+pip3 install tflite-runtime
 
 """
 
@@ -75,6 +80,7 @@ import random
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import tflite_runtime.interpreter as tflite
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from zipfile import ZipFile
@@ -244,8 +250,23 @@ DEFAULTS = {
         "sync_interval_hours": 6,
         "max_offset_sec": 2.0
     },
+    "ai_classification": {
+        "enabled": False,
+        "model_path": "models/meteora_v1.tflite",
+        "label_path": "models/labels.txt",
+        "min_confidence": 0.75,
+        "quarantine_labels": ["insect", "airplane", "satellite"],
+        "delete_insects": True,
+        "input_size": 224
+    },
+    "astrometry": {
+        "enabled": False,
+        "solve_interval_min": 60,
+        "timeout_sec": 45,
+        "use_local_indexes": True
+    },
     "general": {
-        "version": "197.64",
+        "version": "197.65",
         "debug_level": 0,
         "debug_visualization": False,
         "record_raw_frames": False,
@@ -584,6 +605,29 @@ class NtpConfig(BaseModel):
     sync_interval_hours: conint(ge=0) = DEFAULTS["ntp"]["sync_interval_hours"]
     max_offset_sec: float = DEFAULTS["ntp"]["max_offset_sec"]
 
+class AIClassificationConfig(BaseModel):
+    enabled: bool = DEFAULTS["ai_classification"]["enabled"]
+    model_path: str = DEFAULTS["ai_classification"]["model_path"]
+    label_path: str = DEFAULTS["ai_classification"]["label_path"]
+    min_confidence: confloat(ge=0.0, le=1.0) = DEFAULTS["ai_classification"]["min_confidence"]
+    quarantine_labels: List[str] = DEFAULTS["ai_classification"]["quarantine_labels"]
+    delete_insects: bool = DEFAULTS["ai_classification"]["delete_insects"]
+    input_size: conint(gt=32, le=1024) = DEFAULTS["ai_classification"]["input_size"]
+    @field_validator('model_path', 'label_path')
+    @classmethod
+    def validate_paths(cls, v):
+        # We don't strictly require the files to exist at the moment of validation 
+        # (to allow for remote setup), but we ensure they aren't empty strings.
+        if not v or v.strip() == "":
+            raise ValueError("AI model and label paths cannot be empty.")
+        return v
+
+class AstrometryConfig(BaseModel):
+    enabled: bool = DEFAULTS["astrometry"]["enabled"]
+    solve_interval_min: conint(ge=1, le=1440) = DEFAULTS["astrometry"]["solve_interval_min"]
+    timeout_sec: conint(ge=5, le=300) = DEFAULTS["astrometry"]["timeout_sec"]
+    use_local_indexes: bool = DEFAULTS["astrometry"]["use_local_indexes"]
+
 class GeneralConfig(BaseModel):
     version: str = DEFAULTS["general"]["version"]
     debug_visualization : bool = DEFAULTS["general"]["debug_visualization"]
@@ -633,6 +677,8 @@ class MainConfig(BaseModel):
     health_monitor: HealthMonitorConfig = Field(default_factory=HealthMonitorConfig)
     sftp: SftpConfig = Field(default_factory=SftpConfig)
     ntp: NtpConfig = Field(default_factory=NtpConfig)
+    ai_classification: AIClassificationConfig = Field(default_factory=AIClassificationConfig)
+    astrometry: AstrometryConfig = Field(default_factory=AstrometryConfig)
     general: GeneralConfig = Field(default_factory=GeneralConfig) 
     @model_validator(mode='after')
     def check_stack_n_memory_usage(self):
@@ -1839,6 +1885,84 @@ class SkyConditionStatus(Enum):
     CLEAR = auto()
     CLOUDY = auto()
     ERROR = auto()
+    # -----------------
+class NeuralObserver:
+    """Handles TFLite inference to classify detected events."""
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.interpreter = None
+        self.labels = []
+        if self.cfg["enabled"]:
+            self.load_model()
+
+    def load_model(self):
+        try:
+            if not os.path.exists(self.cfg["model_path"]):
+                logging.warning(f"AI: Model file not found at {self.cfg['model_path']}. Disabling AI.")
+                return
+            self.interpreter = tflite.Interpreter(model_path=self.cfg["model_path"])
+            self.interpreter.allocate_tensors()
+            self.input_details = self.interpreter.get_input_details()
+            self.output_details = self.interpreter.get_output_details()
+            with open(self.cfg["label_path"], 'r') as f:
+                self.labels = [line.strip() for line in f.readlines()]
+            logging.info("AI: Neural Intelligence loaded successfully.")
+        except Exception as e:
+            logging.error(f"AI: Model load failed: {e}")
+
+    def classify(self, image_np):
+        if not self.interpreter: return "unknown", 0.0
+        try:
+            # 1. Preprocess: TFLite expects 8-bit float normalized
+            size = self.cfg["input_size"]
+            # Convert 16-bit to 8-bit if necessary
+            img_8 = (image_np >> 8).astype(np.uint8) if image_np.dtype == np.uint16 else image_np
+            img = cv2.resize(img_8, (size, size))
+            img = (img.astype(np.float32) / 255.0)
+            img = np.expand_dims(img, axis=0)
+
+            # 2. Run Inference
+            self.interpreter.set_tensor(self.input_details[0]['index'], img)
+            self.interpreter.invoke()
+
+            # 3. Decode
+            output = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
+            idx = np.argmax(output)
+            return self.labels[idx], float(output[idx])
+        except Exception as e:
+            logging.error(f"AI: Classification error: {e}")
+            return "error", 0.0
+    # -----------------
+class SkySolver:
+    """Handles Astrometry.net local solving."""
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def solve(self, image_path):
+        if not self.cfg["enabled"]: return None
+        # Low priority execution to prevent frame drops
+        solve_dir = os.path.join(os.path.dirname(image_path), "astrometry_tmp")
+        os.makedirs(solve_dir, exist_ok=True)
+        
+        cmd = [
+            "nice", "-n", "15", "solve-field",
+            "--dir", solve_dir,
+            "--no-plots", "--scale-units", "degwidth",
+            "--scale-low", "10", "--scale-high", "100",
+            "--cpulimit", str(self.cfg["timeout_sec"]),
+            "--overwrite", image_path
+        ]
+        try:
+            logging.info(f"Astrometry: Mapping the sky for {os.path.basename(image_path)}...")
+            subprocess.run(cmd, check=False, capture_output=True, timeout=self.cfg["timeout_sec"]+5)
+            
+            # Check for .solved file
+            base = os.path.splitext(os.path.basename(image_path))[0]
+            if os.path.exists(os.path.join(solve_dir, f"{base}.solved")):
+                return {"status": "solved", "timestamp": time.time()}
+        except Exception as e:
+            logging.warning(f"Astrometry: Solve failed: {e}")
+        return {"status": "failed"}
     # --------------------------- Pipeline class and workers ---------------------------
 class Pipeline:
     # -----------------
@@ -1846,7 +1970,7 @@ class Pipeline:
     # -----------------
     def __init__(self, cfg, config_path=None, force_rotation=False):
 
-        self.cfg = cfg
+        # self.cfg = cfg
  
         self.config_path = config_path or "config.json"  # config path
                
@@ -1867,7 +1991,9 @@ class Pipeline:
         self.backlog_file_path = os.path.join(self.general_log_dir, "sftp_backlog.txt")
         self.camera_k_file = os.path.join(self.general_log_dir, "camera_k.csv")
         self.masterpiece_archive_dir = os.path.join(self.daylight_out_dir, "archive")
-
+        self.assets_dir = os.path.join(base_path, "assets")
+        self.ai_filtered_out_dir = os.path.join(base_path, "output/ai_filtered")
+        
         # Guarantee the log directory exists so rotation doesn't fail
         os.makedirs(self.general_log_dir, exist_ok=True)
         if force_rotation:
@@ -1911,10 +2037,10 @@ class Pipeline:
 
         if args.simulate:
             # Use the fake camera
-            self.camera = FrameSimulator(cfg["capture"])
+            self.camera = FrameSimulator(self.cfg["capture"])
         else:
             # Use the real camera
-            self.camera = CameraCapture(cfg["capture"])
+            self.camera = CameraCapture(self.cfg["capture"])
 
         self.background = None
         self.camera_fatal_error = threading.Event()     # Set by capture_loop if fatal
@@ -2012,7 +2138,7 @@ class Pipeline:
         self.last_moon_info = None
         self.last_calibration_error = None
         self.last_event_files = {"image": None, "video": None}
-#        self.last_queue_status = ("ok", "Starting...")  # Holds (css_class, message)
+#        self.last_queue_status = ("ok", "Starting...") # Holds (css_class, message)
         self.timelapse_next_capture_time = 0.0          # Control variable for timelapse timing
         self.capture_stable = threading.Event()
         self.session_start_time = None
@@ -2033,7 +2159,7 @@ class Pipeline:
         self.system_ready = threading.Event()           # Master "All Systems Go" signal
         self.maintenance_timeout_lock = threading.Lock()
         self.maintenance_timeout_until = 0              # A timestamp indicating when the timeout expires
-        self.maintenance_timeout_duration_sec = cfg["general"].get("maintenance_timeout", 300)
+        self.maintenance_timeout_duration_sec = self.cfg["general"].get("maintenance_timeout", 300)
         self.last_sky_status = None
         self.last_daylight_mode = None
         self.background_reset_time = 0
@@ -2045,6 +2171,10 @@ class Pipeline:
         self.last_reject_save_time = 0.0
         # A list of editable checkbox in the dashboard - enable / disable the relative value in the config file
         self.editable_booleans = ["auto_exposure_tuning", "auto_sensitivity_tuning", "stack_align", "astro_stretch"]
+        
+        self.ai = NeuralObserver(self.cfg["ai_classification"])
+        self.solver = SkySolver(self.cfg["astrometry"])
+        self.last_solve_time = 0
 
         self._initial_cleanup()
     # -----------------
@@ -2254,10 +2384,10 @@ class Pipeline:
         self.star_mask_radius = profile["radius"]
         self.alignment_contrast_floor = profile["std_floor"]
         self.effective_max_q = profile["max_q"]
-        self.effective_max_event_frames = profile("max_event_frames")
-        self.effective_max_event_q profile["max_event_q"]
-        self.min_mask_px profile["min_mask_px"]
-        self.ecc_gauss_size profile["ecc_gauss"]
+        self.effective_max_event_frames = profile["max_event_frames"]
+        self.effective_max_event_q = profile["max_event_q"]
+        self.min_mask_px = profile["min_mask_px"]
+        self.ecc_gauss_size = profile["ecc_gauss"]
         self.max_warp_factor = profile["warp_f"]
         self.top_hat_factor = profile["th_f"]  
         
@@ -2834,15 +2964,22 @@ class Pipeline:
                 C_ACCENT = (198, 120, 221) # Meteora Purple
                 C_TEXT = (80, 80, 80)      # Soft grey for text
                 
-                # --- Header ---
-                pdf.set_font("Helvetica", "B", 20)
-                pdf.set_text_color(*C_DARK)
-                pdf.cell(0, 10, text="METEORA OBSERVATORY", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+                # --- Header (Logo Injection) ---
+                logo_path = os.path.join(self.assets_dir, "logo_pdf.jpg")
+                
+                if os.path.exists(logo_path):
+                    # Center a 100mm wide logo on A4 paper (210mm wide) -> x = 55
+                    pdf.image(logo_path, x=55, w=100)
+                    pdf.ln(5)
+                else:                
+                    pdf.set_font("Helvetica", "B", 20)
+                    pdf.set_text_color(*C_DARK)
+                    pdf.cell(0, 10, text="METEORA OBSERVATORY", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
                 
                 pdf.set_font("Helvetica", "I", 12)
                 pdf.set_text_color(*C_ACCENT)
                 pdf.cell(0, 6, text=f"The Watchman's Journal - {self.session_stats['start_time'].strftime('%B %d, %Y')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
-                pdf.ln(6)
+                pdf.ln(5)
                 
                 # --- Helper Function for Clean Grids ---
                 def add_section(title, data_dict):
@@ -3399,9 +3536,9 @@ class Pipeline:
                     
                     # Dampen the correction to prevent wild oscillation jumps
                     if correction_ratio > 1.0:
-                        correction_ratio = min(correction_ratio, cfg.get("ae_step_limit_up")    # Max x increase per step
+                        correction_ratio = min(correction_ratio, cfg.get("ae_step_limit_up"))    # Max x increase per step
                     else:
-                        correction_ratio = max(correction_ratio, cfg.get("ae_step_limit_down")  # Max x decrease per step
+                        correction_ratio = max(correction_ratio, cfg.get("ae_step_limit_down"))  # Max x decrease per step
                     
                     # Treat Exposure and Gain as a single pooled product
                     current_product = new_exposure * new_gain
@@ -4125,6 +4262,15 @@ class Pipeline:
                         with self.status_lock:
                             self.effective_threshold = self.threshold_max
                             self.last_effective_threshold = f"{self.threshold_max} (FAILSAFE)"
+                            
+                now = time.time()
+                if self.cfg["astrometry"]["enabled"] and (now - self.last_solve_time > self.cfg["astrometry"]["solve_interval_min"] * 60):
+                    # Use the snapshot frame saved by the sky monitor
+                    if hasattr(self, 'last_daylight_image_path'):
+                        result = self.solver.solve(self.last_daylight_image_path)
+                        self.last_solve_time = now
+                        with self.status_lock:
+                            self.session_stats["sky_mapped"] = result
                             
                 # Reset the background model to prevent false triggers.
                 if sky_state_changed:
@@ -5447,17 +5593,60 @@ class Pipeline:
                 )
 
                 if stacked_image is not None:
+                    # 1. AI CLASSIFICATION
+                    label, conf = self.ai.classify(stacked_image)
+                    logging.info(f"AI Verdict: {label} ({conf*100:.1f}%)")
+                    
+                    # 2. Determine Destination
+                    is_rejected = False
+                    # If it's a known non-meteor label and we are confident, move it.
+                    is_quarantined = False
+                    if label in self.cfg["ai_classification"]["quarantine_labels"]:
+                        if conf >= self.cfg["ai_classification"]["min_confidence"]:
+                            is_quarantined = True
+                    
+                    target_dir = self.ai_filtered_out_dir if is_rejected else out_dir
+                    if is_quarantined:
+                        logging.warning(f"AI: Event identified as {label}. Moving to Quarantine.")
+                        with self.status_lock:
+                            # Track what we are filtering for the dashboard
+                            key = f"filtered_{label}s"
+                            self.session_stats[key] = self.session_stats.get(key, 0) + 1
+                    
+                    # 3. Save the Stack Image
                     tstamp = datetime.fromisoformat(event_frames[-1][0]).strftime("%Y%m%dT%H%M%SZ")
                     out_name = f"event_stack_{tstamp}.png"
-                    full_path = os.path.join(out_dir, out_name)
+                    full_path = os.path.join(target_dir, out_name)
                     self._safe_save_image(full_path, stacked_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
-                    self.save_event_stack_metadata(full_path, event_frames, final_method, stack_info)
-                    logging.info("Saved event stack image to %s", full_path)
                     
-                    # Update the dashboard state with the path to the new stacked image
+                    # 4. Save Metadata with AI Verdict
+                    stack_info = stack_info or {}
+                    stack_info["ai_label"] = label
+                    stack_info["ai_confidence"] = round(conf, 4)
+                    self.save_event_stack_metadata(full_path, event_frames, final_method, stack_info)
+                    
+                    # 5. SYNC THE VIDEO FILE
+                    # Since the EventWriter might have already saved the MP4 to 'events',
+                    # we must move it to the quarantine folder if the AI rejected the event.
+                    if is_quarantined:
+                        video_name = f"event_{tstamp}.mp4"
+                        old_video_path = os.path.join(self.events_out_dir, video_name)
+                        new_video_path = os.path.join(self.ai_filtered_out_dir, video_name)
+                        
+                        # Wait a moment for the Writer thread to finish the file
+                        time.sleep(1.5) 
+                        if os.path.exists(old_video_path):
+                            shutil.move(old_video_path, new_video_path)
+                            # Also move the video's JSON
+                            old_json = old_video_path.replace(".mp4", ".json")
+                            if os.path.exists(old_json):
+                                shutil.move(old_json, new_video_path.replace(".mp4", ".json"))
+
+                    # Update Dashboard Pointer
                     with self.status_lock:
                         self.last_event_files["image"] = full_path
-
+                        self.last_event_files["ai_verdict"] = f"{label.upper()} ({conf*100:.0f}%)"
+                        
             except Exception as e:
                 logging.exception("Error in event_stacker_loop: %s", e)
     # -----------------
@@ -6159,7 +6348,7 @@ class Pipeline:
         Tier 2: Deletes the oldest timelapse files.
         """
         # architettural choice no need to change via config
-        delete_priority = ["debug", "rejected", "daylight", "timelapse", "events"]
+        delete_priority = ["debug", "rejected","ai_filtered", "daylight", "timelapse", "events"]
         try:
             # Get the path to monitor from the configuration.
             monitor_path = self.cfg["janitor"].get("monitor_path", "/")
@@ -6200,6 +6389,7 @@ class Pipeline:
             dir_map = {
                 "debug": self.debug_out_dir,
                 "rejected": self.rejected_out_dir,
+                "ai_filtered": self.ai_filtered_out_dir,
                 "events": self.events_out_dir,
                 "timelapse": self.timelapse_out_dir,
                 "daylight": self.daylight_out_dir # Points to the diagnostics subfolder
@@ -6954,6 +7144,12 @@ class Pipeline:
             return render_template_string(html_page)
 
         # --- END: SYSTEM TIME PAGE ---
+        
+        @app.route('/assets/<path:filename>')
+        @require_token
+        def serve_assets(filename):
+            """Serves the dashboard logos and UI assets."""
+            return send_from_directory(self.assets_dir, filename)
         
         # --- Pause the acquisition.
         @app.route('/api/pause')
@@ -7950,12 +8146,18 @@ class Pipeline:
             event_image_path = last_event.get("image")
             event_video_path = last_event.get("video")
 
+            # Determine color for the verdict
+            verdict_class = "ok" if "METEOR" in ai_verdict else "warn"
+            if "INSECT" in ai_verdict: verdict_class = "err"
+
             # Get modification time for cache busting
             evt_mtime = 0
             if event_image_path and os.path.exists(event_image_path):
                 evt_mtime = int(os.path.getmtime(event_image_path))
 
             if event_image_path and os.path.exists(event_image_path):
+                # Check if it's in the main events or quarantine for the URL
+                folder = 'ai_filtered' if 'ai_filtered' in event_image_path else 'events'
                 # We need a relative path for the URL, not the full system path
                 # This assumes 'output' is the static folder for Flask
                 relative_image_url = os.path.join('events', os.path.basename(event_image_path))
@@ -7966,13 +8168,19 @@ class Pipeline:
 
                 last_event_html = f"""
                 <div class="card" style="grid-column: 1 / -1;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
                     <h2>Last Captured Event</h2>
-                    <div style="text-align: center;">
+                        <span class="{verdict_class}" style="font-size: 1.2em; padding: 5px 15px; border: 1px solid; border-radius: 20px;">
+                            AI Verdict: {ai_verdict}
+                        </span>
+                    </div>
+                    <div style="text-align: center; margin-top: 10px;">
                         <a href="/{relative_image_url}{token_param}" target="_blank">
-                            <img src="/{relative_image_url}{token_param}&t={evt_mtime}" alt="Last Event Image" style="max-width: 50%; height: auto; border: 1px solid #555; border-radius: 8px;">
+                            <img src="/{relative_image_url}{token_param}&t={evt_mtime}" alt="Last Event" style="max-width: 60%; height: auto; border: 2px solid #444;">
                         </a>
-                        <p style="font-size: smaller; color: #999;">{os.path.basename(event_image_path)}</p>
-                        {video_download_html}
+                        <p style="font-size: 0.9em; color: #aaa; margin-top: 10px;">
+                            Location: <b>{folder.upper()}</b> | Filename: {os.path.basename(event_image_path)}
+                        </p>
                     </div>
                 </div>
                 """
@@ -8053,6 +8261,12 @@ class Pipeline:
                     f'Sky trend: {fp["trend"]} ({fp.get("slope", 0.0):+.2f} / hr)</p>'
                 )
 
+            filtered_stats = (
+                f"Planes: {self.session_stats.get('filtered_airplanes', 0)} | "
+                f"Satellites: {self.session_stats.get('filtered_satellites', 0)} | "
+                f"Insects: {self.session_stats.get('filtered_insects', 0)}"
+            )
+
             morning_report_html = f"""
             <div class="card" style="border: 1px solid #c678dd; background: linear-gradient(145deg, #2b2b2b, #352b3b);">
                 <h2 style="color: #c678dd;">🌙 Session Mission Report</h2>
@@ -8062,6 +8276,7 @@ class Pipeline:
                     <tr><td>Weather Stability</td><td>{100-cloud_percent:.0f}% Clear Sky</td></tr>
                     <tr><td>Moon Influence</td><td>In View for {self.session_stats['moon_visible_minutes']} min (Max Impact: {int(self.session_stats['max_moon_impact']*100)}%)</td></tr>
                     <tr><td>Session Duration</td><td>{dur_total_min // 60}h {dur_total_min % 60}m</td></tr>
+                    <tr><td>AI Interceptions</td><td style="color:#e5c07b; font-size: 0.9em;">{filtered_stats}</td></tr>
                     <tr><td>Chronicle Row</td><td>{chronicle_row}</td></tr>
                 </table>
                 {sparkline_html}
@@ -8299,7 +8514,8 @@ class Pipeline:
               </style>
             </head>
             <body>
-              <header>
+              <header style="display: flex; align-items: center; gap: 20px;">
+                <img src="/assets/logo_dashboard.jpg{token_param}" alt="Meteora Logo" style="height: 60px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.5);">
                 <h1>Meteora Pipeline Status (v{status['version']})</h1>
               </header>
               {feedback_html}
@@ -8576,7 +8792,8 @@ class Pipeline:
             self.general_log_dir,
             self.masterpiece_archive_dir,
             self.rejected_out_dir,
-            self.debug_out_dir
+            self.debug_out_dir,
+            self.ai_filtered_out_dir
         ]
         
         for d in dirs_to_check:
