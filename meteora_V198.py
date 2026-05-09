@@ -266,7 +266,7 @@ DEFAULTS = {
         "use_local_indexes": True
     },
     "general": {
-        "version": "197.65",
+        "version": "198",
         "debug_level": 0,
         "debug_visualization": False,
         "record_raw_frames": False,
