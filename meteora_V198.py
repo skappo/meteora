@@ -80,7 +80,10 @@ import random
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import tflite_runtime.interpreter as tflite
+try:
+    import tflite_runtime.interpreter as tflite
+except ImportError:
+    import tensorflow.lite as tflite
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from zipfile import ZipFile
@@ -1968,9 +1971,10 @@ class Pipeline:
     # -----------------
     # 1. INITIALIZATION & CONFIGURATION
     # -----------------
-    def __init__(self, cfg, config_path=None, force_rotation=False):
+    def __init__(self, cfg, config_path=None, force_rotation=False, simulate_mode=False):
 
-        # self.cfg = cfg
+        self.cfg = cfg
+        self.simulate_mode = simulate_mode
  
         self.config_path = config_path or "config.json"  # config path
                
@@ -2035,7 +2039,7 @@ class Pipeline:
         self.memory_critical.clear()
 
 
-        if args.simulate:
+        if self.simulate_mode:
             # Use the fake camera
             self.camera = FrameSimulator(self.cfg["capture"])
         else:
@@ -5274,8 +5278,8 @@ class Pipeline:
                                         if self.cfg["general"].get("debug_level") >= 3:
                                             self.publish_debug("alignment_mosaic", {"frame_index": i, "correlation": float(cc)}, image=mosaic)
 
-                            except cv2.error:
-                                logging.warning(f"Frame {i}: ECC Alignment crashed.")
+                            except cv2.error as e:
+                                logging.warning(f"Frame {i}: ECC Alignment crashed. {e}")
                                 should_add = False
                                 alignment_meta["error"] = "cv2_error"
                                 weight = 0.8 if bias_mode else 0.0
@@ -9219,7 +9223,7 @@ if __name__ == '__main__':
     config = Pipeline.load_and_validate_config(args.config)
 
     # 2. Create an instance of the main application class.
-    app = Pipeline(cfg=config, config_path=args.config, force_rotation=args.force_rotation)
+    app = Pipeline(cfg=config, config_path=args.config, force_rotation=args.force_rotation, simulate_mode=args.simulate)
 
     # 3. Run the application.
     app.run()
